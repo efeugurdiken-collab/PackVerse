@@ -31,8 +31,8 @@ class Job(Base, TimestampMixin):
         default=JobStatus.PENDING,
         index=True,
     )
-    input_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    output_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    input_json: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
+    output_json: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

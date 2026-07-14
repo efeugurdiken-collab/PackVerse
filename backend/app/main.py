@@ -5,6 +5,7 @@ no RAG - those are introduced in later sprints per the PackVerse OS
 Obsidian vault roadmap (10 Roadmap/Current Sprint.md).
 """
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting %s (%s)", settings.app_name, settings.environment)
     yield
     logger.info("Shutting down %s", settings.app_name)

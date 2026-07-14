@@ -20,6 +20,6 @@ class WorkflowDefinitionRead(BaseModel):
     name: str
     version: str
     status: WorkflowStatus
-    definition_json: dict
+    definition_json: dict[str, object]
     created_at: datetime
     updated_at: datetime

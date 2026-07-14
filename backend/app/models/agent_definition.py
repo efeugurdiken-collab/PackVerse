@@ -32,7 +32,9 @@ class AgentDefinition(Base, TimestampMixin):
         default=AgentStatus.DRAFT,
         index=True,
     )
-    configuration_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    configuration_json: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"<AgentDefinition id={self.id} name={self.name!r} status={self.status}>"

@@ -23,7 +23,7 @@ class ProductCreate(BaseModel):
     product_type: ProductType
     price_cents: int = Field(ge=0)
     currency: str = Field(min_length=3, max_length=3)
-    metadata_json: dict = Field(default_factory=dict)
+    metadata_json: dict[str, object] = Field(default_factory=dict)
 
     @field_validator("currency")
     @classmethod
@@ -47,7 +47,7 @@ class ProductUpdate(BaseModel):
     status: ProductStatus | None = None
     price_cents: int | None = Field(default=None, ge=0)
     currency: str | None = Field(default=None, min_length=3, max_length=3)
-    metadata_json: dict | None = None
+    metadata_json: dict[str, object] | None = None
 
     @field_validator("currency")
     @classmethod
@@ -69,6 +69,6 @@ class ProductRead(BaseModel):
     version: str
     price_cents: int
     currency: str
-    metadata_json: dict
+    metadata_json: dict[str, object]
     created_at: datetime
     updated_at: datetime

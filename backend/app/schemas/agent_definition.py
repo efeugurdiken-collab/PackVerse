@@ -21,6 +21,6 @@ class AgentDefinitionRead(BaseModel):
     role: str
     version: str
     status: AgentStatus
-    configuration_json: dict
+    configuration_json: dict[str, object]
     created_at: datetime
     updated_at: datetime

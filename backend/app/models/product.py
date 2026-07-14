@@ -48,7 +48,7 @@ class Product(Base, TimestampMixin):
     version: Mapped[str] = mapped_column(String(32), nullable=False, default="v1.0")
     price_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
-    metadata_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata_json: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False, default=dict)
 
     assets: Mapped[list[Asset]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
