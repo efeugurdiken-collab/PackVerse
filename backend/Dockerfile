@@ -19,8 +19,12 @@ COPY pyproject.toml ./
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY tests ./tests
 
-RUN pip install --no-cache-dir .
+# Installed with the [dev] extra (pytest, ruff, mypy, httpx) so this same
+# image can run Sprint P1/P2 runtime verification in place, not just serve
+# the app. Revisit with a multi-stage build before this ships to prod.
+RUN pip install --no-cache-dir ".[dev]"
 
 EXPOSE 8000
 
