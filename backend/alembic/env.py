@@ -20,7 +20,14 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.sync_database_url)
+
+# alembic.ini leaves sqlalchemy.url blank on purpose - the app's own
+# settings are the default source of truth. But callers that already set
+# sqlalchemy.url programmatically before invoking Alembic (e.g. the test
+# suite pointing this at settings.test_database_url) must win, so only
+# fall back to the app default database when nothing was already set.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", settings.sync_database_url)
 
 
 def run_migrations_offline() -> None:

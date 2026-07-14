@@ -8,10 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps needed to build psycopg2 (used by Alembic's sync driver)
+# curl is needed for the container HEALTHCHECK below. psycopg2-binary
+# (declared in pyproject.toml, used by Alembic's sync driver) ships
+# prebuilt wheels, so no build toolchain is required for it specifically.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,7 +20,7 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
 
-RUN pip install --no-cache-dir . && pip install --no-cache-dir psycopg2-binary
+RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
