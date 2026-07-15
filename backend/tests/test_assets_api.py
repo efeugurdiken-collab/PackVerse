@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+import warnings
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SAWarning
 
 from app.models.asset import Asset
 from app.models.enums import AssetStatus, StorageProvider, UserRole
+from app.models.product import Product
 from app.services import asset_service
 from app.services.asset_service import build_storage_key, sanitize_filename
 from app.storage.exceptions import StorageDeleteFailed
@@ -171,22 +173,39 @@ async def test_duplicate_filename_uploads_do_not_collide(
     assert second_download.content == JPEG_BYTES
 
 
-async def test_database_rollback_removes_stored_object(
-    db_session, storage_backend, make_product, make_user
-) -> None:
-    """If the post-storage-write database commit fails, the just-written
-    storage object must not be left behind (see asset_service.upload_asset's
-    IntegrityError branch)."""
+async def _seed_pk_collision(db_session, make_product, make_user) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+    """Commits a real Asset row, then expunges the Python object from the
+    session's identity map (without deleting the row) so that a second
+    Asset object built with the same primary key produces a genuine
+    database-level IntegrityError on flush.
+
+    Without the expunge, a second in-memory Asset instance sharing the
+    already-persistent instance's primary key is instead an in-session
+    identity-map conflict, which SQLAlchemy flags with an SAWarning
+    ("New instance ... conflicts with persistent instance ...") - a
+    different, ORM-internal condition than the real-world case this test
+    means to exercise (another process/commit already wrote this row).
+
+    Returns plain (product_id, uploader_id, colliding_id) values, never
+    the ORM instances themselves: any operation that triggers a rollback
+    (as asset_service.upload_asset's IntegrityError branch does) expires
+    every object still attached to db_session, and a later *synchronous*
+    attribute access on an expired instance (e.g. inside an f-string)
+    raises sqlalchemy.exc.MissingGreenlet, since the implicit refresh
+    SELECT that expired access would trigger can only run inside an
+    awaited call.
+    """
     product = await make_product()
     uploader = await make_user(role=UserRole.OPERATOR)
+    product_id, uploader_id = product.id, uploader.id
 
     colliding_id = uuid.uuid4()
     pre_existing = Asset(
         id=colliding_id,
-        product_id=product.id,
+        product_id=product_id,
         asset_type="file",
         filename="existing.png",
-        storage_key=f"products/{product.id}/{colliding_id}/existing.png",
+        storage_key=f"products/{product_id}/{colliding_id}/existing.png",
         mime_type="image/png",
         size_bytes=1,
         checksum="deadbeef",
@@ -195,22 +214,134 @@ async def test_database_rollback_removes_stored_object(
     )
     db_session.add(pre_existing)
     await db_session.commit()
+    db_session.expunge(pre_existing)
+    return product_id, uploader_id, colliding_id
 
+
+async def _attempt_colliding_upload(
+    db_session, storage_backend, product_id: uuid.UUID, uploader_id: uuid.UUID, colliding_id: uuid.UUID
+) -> None:
     with patch("app.services.asset_service.uuid.uuid4", return_value=colliding_id):
         with pytest.raises(IntegrityError):
             await asset_service.upload_asset(
                 db_session,
                 storage_backend,
-                product_id=product.id,
+                product_id=product_id,
                 asset_type="file",
                 original_filename="new-upload.png",
                 content_type="image/png",
                 content=PNG_BYTES,
-                uploaded_by_user_id=uploader.id,
+                uploaded_by_user_id=uploader_id,
             )
 
-    new_key = f"products/{product.id}/{colliding_id}/new-upload.png"
+
+async def test_database_rollback_removes_stored_object(
+    db_session, storage_backend, make_product, make_user
+) -> None:
+    """If the post-storage-write database commit fails, the just-written
+    storage object must not be left behind (see asset_service.upload_asset's
+    IntegrityError branch)."""
+    product_id, uploader_id, colliding_id = await _seed_pk_collision(
+        db_session, make_product, make_user
+    )
+    await _attempt_colliding_upload(db_session, storage_backend, product_id, uploader_id, colliding_id)
+
+    new_key = build_storage_key(
+        product_id=product_id, asset_id=colliding_id, safe_filename="new-upload.png"
+    )
     assert await storage_backend.exists(new_key) is False
+
+
+async def test_session_remains_usable_after_upload_rollback(
+    db_session, storage_backend, make_product, make_user
+) -> None:
+    """The session must not be left broken by the service layer's own
+    controlled rollback - a plain, fully-awaited query (never an
+    attribute access on a previously loaded, now-expired instance) must
+    still succeed afterward."""
+    product_id, uploader_id, colliding_id = await _seed_pk_collision(
+        db_session, make_product, make_user
+    )
+    await _attempt_colliding_upload(db_session, storage_backend, product_id, uploader_id, colliding_id)
+
+    refreshed = await db_session.get(Product, product_id)
+    assert refreshed is not None
+    assert refreshed.id == product_id
+
+
+async def test_rollback_cleanup_uses_preserved_key_not_orm_attribute(
+    db_session, storage_backend, make_product, make_user
+) -> None:
+    """The IntegrityError cleanup path must delete the storage object
+    using the plain `storage_key` local variable captured before the
+    failed commit, never by reading `asset.storage_key` back off the ORM
+    object post-rollback."""
+    product_id, uploader_id, colliding_id = await _seed_pk_collision(
+        db_session, make_product, make_user
+    )
+
+    deleted_keys: list[str] = []
+    real_delete = storage_backend.delete
+
+    async def _spy_delete(key: str) -> None:
+        deleted_keys.append(key)
+        await real_delete(key)
+
+    with patch.object(storage_backend, "delete", _spy_delete):
+        await _attempt_colliding_upload(db_session, storage_backend, product_id, uploader_id, colliding_id)
+
+    expected_key = build_storage_key(
+        product_id=product_id, asset_id=colliding_id, safe_filename="new-upload.png"
+    )
+    assert deleted_keys == [expected_key]
+
+
+async def test_rollback_cleanup_emits_no_identity_conflict_warning(
+    db_session, storage_backend, make_product, make_user
+) -> None:
+    """Regression guard for the SAWarning ("New instance ... conflicts
+    with persistent instance ...") that a same-session identity-key
+    collision would otherwise emit - see _seed_pk_collision's expunge()."""
+    product_id, uploader_id, colliding_id = await _seed_pk_collision(
+        db_session, make_product, make_user
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await _attempt_colliding_upload(db_session, storage_backend, product_id, uploader_id, colliding_id)
+
+    identity_conflicts = [
+        w
+        for w in caught
+        if issubclass(w.category, SAWarning) and "conflicts with persistent instance" in str(w.message)
+    ]
+    assert identity_conflicts == []
+
+
+async def test_rollback_preserves_original_integrity_error(
+    db_session, storage_backend, make_product, make_user
+) -> None:
+    """The service layer re-raises the driver's own error via a bare
+    `raise` inside the except block - the original IntegrityError must
+    reach the caller unwrapped and unreplaced, not converted into a
+    different domain/storage exception."""
+    product_id, uploader_id, colliding_id = await _seed_pk_collision(
+        db_session, make_product, make_user
+    )
+
+    with patch("app.services.asset_service.uuid.uuid4", return_value=colliding_id):
+        with pytest.raises(IntegrityError) as excinfo:
+            await asset_service.upload_asset(
+                db_session,
+                storage_backend,
+                product_id=product_id,
+                asset_type="file",
+                original_filename="new-upload.png",
+                content_type="image/png",
+                content=PNG_BYTES,
+                uploaded_by_user_id=uploader_id,
+            )
+    assert type(excinfo.value) is IntegrityError
 
 
 # --- Listing and detail -----------------------------------------------------
