@@ -1,13 +1,14 @@
-# Local Verification (P1-P4)
+# Local Verification (P1-P5)
 
-**Status: P1, P2, P3, P4 verified locally.** Parts A, B, and D below
-are historical record of runs already completed against a real
-PostgreSQL instance (P4 required two follow-up fixes - a missing
-`pathlib` import and a `MissingGreenlet`/identity-map test bug, both
-resolved and re-verified). This document exists because the environment
-this code was written in cannot run it, and the CTO instruction for
-every sprint in this repo has been explicit: do not claim a sprint
-passed, and give exact reproducible steps instead.
+**Status: P1, P2, P3, P4 verified locally. P5 not yet verified.** Parts
+A, B, and D below are historical record of runs already completed
+against a real PostgreSQL instance (P4 required two follow-up fixes - a
+missing `pathlib` import and a `MissingGreenlet`/identity-map test bug,
+both resolved and re-verified). Part E below is the reproduction guide
+for Sprint P5, awaiting its first real local run. This document exists
+because the environment this code was written in cannot run it, and the
+CTO instruction for every sprint in this repo has been explicit: do not
+claim a sprint passed, and give exact reproducible steps instead.
 
 ## Why verification could not run here
 
@@ -316,4 +317,139 @@ All commands in Part D have been run against a real PostgreSQL instance
 and object storage volume and produced the expected output (`129
 passed`, ruff clean, mypy clean on 47 source files). Per CTO
 instruction: Sprint P5 (LLM Gateway) still does not start until this is
-explicitly approved.
+explicitly approved. (It has since been approved; see Part E below.)
+
+## Part E — Sprint P5 (LLM Gateway)
+
+**Not yet verified.** Written and statically validated
+(`python -m py_compile` across `app/` and `tests/`, no runtime
+execution) in the same no-Docker, no-network sandbox as every prior
+sprint. Needs a real local run before it can be marked verified - same
+discipline as Parts C and D: don't accept a claimed pass without actual
+pasted command output, cross-checked numerically against the P4
+baseline (129 passed / 47 mypy-clean source files) before trusting a
+delta.
+
+Same reset discipline as Parts C/D applies: run `docker compose down`
+then `docker compose up --build -d` first, so the newly added `httpx`,
+`jsonschema`, and `pytest-httpx`/`types-jsonschema` dependencies are
+actually installed before testing.
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current            # -> 7c19e4b8a2d6 (head)
+docker compose exec backend alembic downgrade -1        # drops only the llm_requests table
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade ae14cc314d2f   # back to P4 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `7c19e4b8a2d6 (head)` after the first upgrade; the `downgrade
+-1` step removes only the `llm_requests` table while every P2/P3/P4
+table and column stays intact (spot-check with
+`docker compose exec db psql -U packverse -d packverse -c '\dt'` -
+`llm_requests` should be the only table to disappear, and
+`docker compose exec db psql -U packverse -d packverse -c '\d assets'`
+should still show all P4 storage columns); the final `downgrade base` /
+`upgrade head` pair proves the whole four-migration chain still runs
+cleanly end to end.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_llm_gateway.py`, `test_llm_fake_provider.py`,
+`test_llm_anthropic_adapter.py`, `test_llm_openai_adapter.py`,
+`test_llm_structured_output.py`, and `test_llm_api.py` passes, plus the
+new LLM-related additions to `test_config.py` and the P5 additions to
+`test_migrations.py`, on top of all P1-P4 tests continuing to pass
+unmodified (regression). Roughly 129 (P1-P4 baseline) + ~76 new P5
+tests. No test in this sprint makes a real network call - the
+Anthropic/OpenAI adapter tests use `pytest-httpx`'s `httpx_mock` fixture
+to mock HTTP responses, and the API-level tests route exclusively
+through the `fake` provider via `app.dependency_overrides`.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` → "All checks passed!"; `mypy app` → "Success: no
+issues found in N source files" where N is larger than P4's 47 (new
+files: `app/llm/{__init__,base,models,exceptions,gateway,routing,pricing,factory}.py`,
+`app/llm/providers/{__init__,_shared,fake,anthropic,openai_compatible}.py`,
+`app/models/llm_request.py`, `app/schemas/llm.py`,
+`app/services/llm_service.py`, `app/api/v1/llm.py`).
+
+### 4. Manual smoke test (optional but recommended, no API key needed)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# Uses the network-free fake provider - works even with no ANTHROPIC_API_KEY
+# or OPENAI_API_KEY set, as long as LLM_ALLOWED_PROVIDERS includes "fake"
+# (it does by default).
+curl -s -X POST http://localhost:8000/api/v1/llm/generate \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"provider":"fake","model":"fake-v1","messages":[{"role":"user","content":"hello"}]}'
+
+curl -s http://localhost:8000/api/v1/llm/providers -H "Authorization: Bearer $TOKEN"
+curl -s http://localhost:8000/api/v1/llm/health -H "Authorization: Bearer $TOKEN"
+
+# To smoke-test a real provider instead, set ANTHROPIC_API_KEY in .env,
+# restart the backend, and pass "provider":"anthropic" above.
+```
+
+Expected: the `/generate` call returns `200` with a `content` field
+(the fake provider's deterministic echo of the last user message) and
+`estimated_cost_usd: null` (no pricing configured for `fake:fake-v1` by
+default); `/providers` lists `fake` with `"configured": true`;
+`/health` reports `"status": "reachable"` for `fake`.
+
+### If it fails
+
+- **`alembic downgrade -1` from head errors on dropping the FK
+  constraint**: check that the constraint name matches exactly what the
+  upgrade created (`fk_llm_requests_user_id_users`) - PostgreSQL is
+  case-sensitive here.
+- **`test_llm_anthropic_adapter.py` / `test_llm_openai_adapter.py`
+  failures**: these tests never hit the real network - if they're
+  attempting real HTTP calls, `pytest-httpx` likely isn't installed or
+  the `httpx_mock` fixture isn't being picked up; confirm
+  `pip show pytest-httpx` inside the container.
+- **`test_llm_api.py` failures around dependency overrides**: confirm
+  `app.dependency_overrides[get_settings]` and
+  `app.dependency_overrides[get_llm_gateway]` are both being cleared
+  between tests (check `conftest.py`'s override-cleanup fixture) - a
+  leaked override from one test can make an unrelated test silently use
+  the wrong gateway.
+- **`mypy` failures in `app/llm/providers/anthropic.py` or
+  `openai_compatible.py`**: confirm `httpx` and `jsonschema`'s type
+  stubs resolve cleanly; `types-jsonschema` must be installed (dev
+  extra) for `jsonschema.validate`'s signature to type-check under
+  `mypy --strict`.
+- **A provider health check test hangs instead of failing fast**:
+  confirm `LLM_TIMEOUT_SECONDS` is a small value in the test
+  environment (tests construct their own `Settings` instances, so this
+  should not depend on `.env`, but worth ruling out if a health-check
+  test is unexpectedly slow).
+
+## Acceptance (P5)
+
+**Unverified pending a real local run.** Once every command in Part E
+above has been run against a real PostgreSQL instance and produced the
+expected output, update this section (and the README's Roadmap/status
+blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
+hash, the same way Parts C and D were updated after their first real
+runs. Per CTO instruction: Sprint P6 (AI Runtime) does not start until
+this is explicitly approved.

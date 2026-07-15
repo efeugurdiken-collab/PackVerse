@@ -21,7 +21,8 @@ from alembic.config import Config
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 P2_REVISION = "06b17a0f30ad"
 P3_REVISION = "1f20f57819a3"
-P4_REVISION = "ae14cc314d2f"  # head as of Sprint P4
+P4_REVISION = "ae14cc314d2f"
+P5_REVISION = "7c19e4b8a2d6"  # head as of Sprint P5
 
 EXPECTED_TABLES = {
     "products",
@@ -30,6 +31,7 @@ EXPECTED_TABLES = {
     "agent_definitions",
     "workflow_definitions",
     "users",
+    "llm_requests",
 }
 
 
@@ -40,7 +42,7 @@ def _alembic_config(sync_url: str) -> Config:
     return cfg
 
 
-def test_migration_upgrade_creates_all_six_tables(test_sync_database_url: str) -> None:
+def test_migration_upgrade_creates_all_expected_tables(test_sync_database_url: str) -> None:
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -75,11 +77,11 @@ def test_migration_upgrade_is_idempotent_and_downgrade_is_clean(
 
 def test_migration_revision_identifiers_match_expected() -> None:
     """Guards against silently renumbering any migration - the Sprint
-    P2/P3/P4 reports cite these exact revision ids as the schema
+    P2/P3/P4/P5 reports cite these exact revision ids as the schema
     history, and each sprint's downgrade-to-previous test depends on the
     down_revision chain staying intact."""
     versions_dir = BACKEND_ROOT / "alembic" / "versions"
-    for revision in (P2_REVISION, P3_REVISION, P4_REVISION):
+    for revision in (P2_REVISION, P3_REVISION, P4_REVISION, P5_REVISION):
         matches = list(versions_dir.glob(f"{revision}_*.py"))
         assert len(matches) == 1, f"expected exactly one migration file for {revision}"
 
@@ -104,16 +106,19 @@ def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_ur
         command.downgrade(cfg, "base")
 
 
-def test_migration_downgrade_one_step_removes_only_p4_columns(
+def test_migration_downgrade_to_p4_removes_only_p4_columns(
     test_sync_database_url: str,
 ) -> None:
-    """`alembic downgrade -1` from head must remove exactly the P4
+    """Downgrading from head (P5) to P4 must remove exactly the P4
     columns added to assets and nothing else - the P3 users table and
-    every column that existed before P4 must survive untouched."""
+    every column that existed before P4 must survive untouched. Uses the
+    explicit P4_REVISION target (not "-1") since head no longer *is* P4
+    as of Sprint P5 - see test_migration_downgrade_one_step_from_head_
+    removes_only_llm_requests_table for the "-1 from current head" case."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
-        command.downgrade(cfg, "-1")
+        command.downgrade(cfg, P4_REVISION)
 
         engine = sa.create_engine(test_sync_database_url)
         inspector = sa.inspect(engine)
@@ -121,8 +126,10 @@ def test_migration_downgrade_one_step_removes_only_p4_columns(
         asset_columns = {col["name"] for col in inspector.get_columns("assets")}
         engine.dispose()
 
-        # Every table, including P3's users, must still be present.
-        assert EXPECTED_TABLES <= table_names
+        # Every table up through P4, including P3's users, must still be
+        # present; P5's llm_requests must not.
+        assert EXPECTED_TABLES - {"llm_requests"} <= table_names
+        assert "llm_requests" not in table_names
 
         p4_only_columns = {
             "original_filename",
@@ -144,6 +151,37 @@ def test_migration_downgrade_one_step_removes_only_p4_columns(
         # And upgrading back to head must succeed cleanly from here -
         # not raising is the assertion; alembic's command functions
         # don't return a meaningful value to inspect.
+        command.upgrade(cfg, "head")
+    finally:
+        command.downgrade(cfg, "base")
+
+
+def test_migration_downgrade_one_step_from_head_removes_only_llm_requests_table(
+    test_sync_database_url: str,
+) -> None:
+    """`alembic downgrade -1` from head (P5) must remove exactly the
+    llm_requests table and nothing else - every P1-P4 table, including
+    P4's asset storage columns, must survive untouched."""
+    cfg = _alembic_config(test_sync_database_url)
+    command.upgrade(cfg, "head")
+    try:
+        command.downgrade(cfg, "-1")
+
+        engine = sa.create_engine(test_sync_database_url)
+        inspector = sa.inspect(engine)
+        table_names = set(inspector.get_table_names())
+        asset_columns = {col["name"] for col in inspector.get_columns("assets")}
+        engine.dispose()
+
+        assert "llm_requests" not in table_names
+        assert EXPECTED_TABLES - {"llm_requests"} <= table_names
+
+        p4_columns = {
+            "original_filename", "content_type", "etag", "storage_backend",
+            "status", "uploaded_by_user_id", "deleted_at",
+        }
+        assert p4_columns <= asset_columns
+
         command.upgrade(cfg, "head")
     finally:
         command.downgrade(cfg, "base")

@@ -133,3 +133,83 @@ def test_allowed_mime_types_list_parses_comma_separated_string() -> None:
         environment="development", allowed_mime_types="image/png, image/jpeg,application/pdf"
     )
     assert settings.allowed_mime_types_list == ["image/png", "image/jpeg", "application/pdf"]
+
+
+# --- LLM Gateway settings (Sprint P5) -----------------------------------
+
+
+def test_llm_default_provider_is_unset_by_default() -> None:
+    settings = Settings(environment="development")
+    assert settings.llm_default_provider is None
+
+
+def test_llm_allowed_providers_defaults_to_all_three_known_providers() -> None:
+    settings = Settings(environment="development")
+    assert set(settings.llm_allowed_providers_list) == {"anthropic", "openai", "fake"}
+
+
+def test_llm_default_provider_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="llm_default_provider must be one of"):
+        Settings(environment="development", llm_default_provider="cohere")
+
+
+def test_llm_allowed_providers_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="unknown provider"):
+        Settings(environment="development", llm_allowed_providers="fake,cohere")
+
+
+def test_llm_allowed_providers_rejects_empty_list() -> None:
+    with pytest.raises(ValidationError, match="at least one provider"):
+        Settings(environment="development", llm_allowed_providers="")
+
+
+def test_llm_default_provider_must_be_in_allowed_providers() -> None:
+    with pytest.raises(ValidationError, match="is not in"):
+        Settings(
+            environment="development",
+            llm_allowed_providers="fake",
+            llm_default_provider="anthropic",
+        )
+
+
+def test_llm_credentials_are_not_required_at_settings_construction_time() -> None:
+    """The sprint spec is explicit: "missing credentials must fail only
+    when that provider is selected" - Settings itself must boot cleanly
+    with every provider allowed and zero credentials configured; only
+    app/llm/factory.py enforces credential presence, lazily."""
+    settings = Settings(environment="development", llm_allowed_providers="anthropic,openai,fake")
+    assert settings.anthropic_api_key is None
+    assert settings.openai_api_key is None
+
+
+def test_llm_model_aliases_rejects_malformed_json() -> None:
+    with pytest.raises(ValidationError, match="must be valid JSON"):
+        Settings(environment="development", llm_model_aliases="{not json")
+
+
+def test_llm_model_aliases_rejects_non_object_json() -> None:
+    with pytest.raises(ValidationError, match="must be a JSON object"):
+        Settings(environment="development", llm_model_aliases="[1, 2, 3]")
+
+
+def test_llm_model_aliases_map_parses_nested_structure() -> None:
+    settings = Settings(
+        environment="development",
+        llm_model_aliases='{"anthropic": {"fast": "claude-haiku"}}',
+    )
+    assert settings.llm_model_aliases_map == {"anthropic": {"fast": "claude-haiku"}}
+
+
+def test_llm_pricing_json_rejects_malformed_json() -> None:
+    with pytest.raises(ValidationError, match="must be valid JSON"):
+        Settings(environment="development", llm_pricing_json="not json")
+
+
+def test_llm_pricing_map_parses_nested_structure() -> None:
+    settings = Settings(
+        environment="development",
+        llm_pricing_json='{"fake:m1": {"input_per_1k": "0.001", "output_per_1k": "0.002"}}',
+    )
+    assert settings.llm_pricing_map == {
+        "fake:m1": {"input_per_1k": "0.001", "output_per_1k": "0.002"}
+    }

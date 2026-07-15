@@ -95,3 +95,25 @@ class AssetStorageOperationFailedError(DomainError):
     def __init__(self, operation: str) -> None:
         super().__init__(f"Storage {operation} failed")
         self.operation = operation
+
+
+# --- LLM Gateway domain errors (Sprint P5) ---
+# app.llm.exceptions.LLMError and its subclasses are the LLM Gateway's
+# own transport-agnostic error hierarchy (raised by app/llm/gateway.py
+# and the provider adapters); app/api/v1/llm.py maps those directly.
+# LLMRequestNotFoundError below is an ordinary service-layer domain
+# error for a request-history row - kept here for consistency with
+# every other *NotFoundError in this file, rather than added to
+# app/llm/exceptions.py.
+
+
+class LLMRequestNotFoundError(DomainError):
+    """Raised both for a genuinely-missing id and for an id that exists
+    but isn't visible to the caller (a non-admin requesting someone
+    else's request) - both map to the same 404, so the endpoint can't be
+    used to enumerate other users' request ids. See
+    app/services/llm_service.py's get_request."""
+
+    def __init__(self, request_id: object) -> None:
+        super().__init__(f"LLM request {request_id} not found")
+        self.request_id = request_id

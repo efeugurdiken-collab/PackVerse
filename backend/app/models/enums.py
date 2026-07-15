@@ -89,3 +89,14 @@ class StorageProvider(str, Enum):
 
     LOCAL = "local"
     S3 = "s3"
+
+
+class LLMRequestStatus(str, Enum):
+    """Lifecycle of a single LLM Gateway call (Sprint P5). PENDING is set
+    the instant the row is created, before the provider call is made;
+    the request flips to SUCCEEDED or FAILED once the gateway call
+    resolves - see app/services/llm_service.py."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"

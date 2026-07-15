@@ -3,12 +3,13 @@
 Uses Pydantic Settings so every config value is typed and validated at
 startup, rather than read ad hoc via os.environ throughout the codebase.
 """
+import json
 import logging
 import secrets
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,12 @@ logger = logging.getLogger(__name__)
 _ENV_FILE = Path(".env")
 _MIN_JWT_SECRET_LENGTH = 32  # enforced on any explicitly-provided secret
 _GENERATED_JWT_SECRET_BYTES = 64  # entropy of an auto-generated dev secret
+
+# --- LLM Gateway (Sprint P5) ---
+# The only providers app/llm/providers/ actually implements. Deliberately
+# closed (not "any string") so a typo in LLM_DEFAULT_PROVIDER or
+# LLM_ALLOWED_PROVIDERS fails at startup, not on the first request.
+KNOWN_LLM_PROVIDERS = frozenset({"anthropic", "openai", "fake"})
 
 
 class Settings(BaseSettings):
@@ -85,6 +92,47 @@ class Settings(BaseSettings):
         "model/stl,application/sla,application/octet-stream"
     )
 
+    # --- LLM Gateway (Sprint P5) ---
+    # Unset by default on purpose: routing.py's rule #3 ("fail clearly if
+    # no valid provider exists") only bites when neither an explicit
+    # request-level provider nor this default is usable, so leaving this
+    # unset is a legitimate, safe starting state - not a config error.
+    llm_default_provider: str | None = None
+    llm_default_model: str | None = None
+    llm_timeout_seconds: float = 30.0
+    llm_max_retries: int = 2
+    llm_max_output_tokens: int = 4096
+    # Comma-separated subset of KNOWN_LLM_PROVIDERS. "fake" ships enabled
+    # by default so the generate endpoint is smoke-testable
+    # (`{"provider": "fake", ...}`) with zero external credentials - see
+    # the Quality Gates section of Sprint P5's spec.
+    llm_allowed_providers: str = "anthropic,openai,fake"
+    # JSON: {"<provider>": {"<alias>": "<model-name>", ...}, ...}. Aliases
+    # (fast/balanced/quality) resolve through this configuration, never
+    # through hardcoded model names in routing.py.
+    llm_model_aliases: str = "{}"
+    # JSON: {"<provider>:<model>": {"input_per_1k": "<decimal-string>",
+    # "output_per_1k": "<decimal-string>"}, ...}. A provider/model pair
+    # with no entry here prices as null, never a fabricated guess - see
+    # app/llm/pricing.py.
+    llm_pricing_json: str = "{}"
+
+    # Provider credentials are intentionally NOT validated for presence
+    # here (unlike Storage's validate_s3_settings_when_selected in P4) -
+    # the sprint spec is explicit: "missing credentials must fail only
+    # when that provider is selected". app/llm/factory.py raises
+    # LLMProviderNotConfigured lazily, the first time a request actually
+    # asks for a provider whose credentials are missing.
+    anthropic_api_key: str | None = None
+    anthropic_base_url: str = "https://api.anthropic.com"
+    anthropic_default_model: str | None = None
+
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_default_model: str | None = None
+    openai_organization: str | None = None
+    openai_project: str | None = None
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:
@@ -127,6 +175,84 @@ class Settings(BaseSettings):
     @property
     def allowed_mime_types_list(self) -> list[str]:
         return [t.strip() for t in self.allowed_mime_types.split(",") if t.strip()]
+
+    @field_validator("llm_default_provider")
+    @classmethod
+    def validate_llm_default_provider(cls, v: str | None) -> str | None:
+        if v is not None and v not in KNOWN_LLM_PROVIDERS:
+            raise ValueError(
+                f"llm_default_provider must be one of {sorted(KNOWN_LLM_PROVIDERS)} or unset, "
+                f"got {v!r}"
+            )
+        return v
+
+    @field_validator("llm_allowed_providers")
+    @classmethod
+    def validate_llm_allowed_providers(cls, v: str) -> str:
+        names = [p.strip() for p in v.split(",") if p.strip()]
+        if not names:
+            raise ValueError("llm_allowed_providers must list at least one provider")
+        unknown = set(names) - KNOWN_LLM_PROVIDERS
+        if unknown:
+            raise ValueError(
+                f"llm_allowed_providers contains unknown provider(s) {sorted(unknown)} - "
+                f"must be a subset of {sorted(KNOWN_LLM_PROVIDERS)}"
+            )
+        return v
+
+    @field_validator("llm_model_aliases", "llm_pricing_json")
+    @classmethod
+    def validate_llm_json_config(cls, v: str, info: ValidationInfo) -> str:
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{info.field_name} must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{info.field_name} must be a JSON object")
+        return v
+
+    @model_validator(mode="after")
+    def validate_llm_default_provider_is_allowed(self) -> "Settings":
+        """A default provider that isn't in the allowed list would fail
+        confusingly on the first real request instead of at startup -
+        this is exactly the "invalid provider configuration" the sprint
+        spec says production must reject up front."""
+        if self.llm_default_provider is not None:
+            allowed = {p.strip() for p in self.llm_allowed_providers.split(",") if p.strip()}
+            if self.llm_default_provider not in allowed:
+                raise ValueError(
+                    f"llm_default_provider {self.llm_default_provider!r} is not in "
+                    f"llm_allowed_providers ({self.llm_allowed_providers!r})"
+                )
+        return self
+
+    @property
+    def llm_allowed_providers_list(self) -> list[str]:
+        return [p.strip() for p in self.llm_allowed_providers.split(",") if p.strip()]
+
+    @property
+    def llm_model_aliases_map(self) -> dict[str, dict[str, str]]:
+        """{"<provider>": {"<alias>": "<model-name>"}}. Validated as
+        well-formed JSON at startup (validate_llm_json_config); reparsed
+        here rather than cached, since these blobs are tiny and this
+        keeps Settings a plain, picklable/comparable model."""
+        parsed = json.loads(self.llm_model_aliases)
+        return {
+            str(provider): {str(alias): str(model) for alias, model in aliases.items()}
+            for provider, aliases in parsed.items()
+        }
+
+    @property
+    def llm_pricing_map(self) -> dict[str, dict[str, str]]:
+        """{"<provider>:<model>": {"input_per_1k": "...", "output_per_1k": "..."}}
+        - kept as strings here (Decimal isn't JSON-serializable/hashable
+        in a way pydantic-settings needs); app/llm/pricing.py converts to
+        Decimal at lookup time."""
+        parsed = json.loads(self.llm_pricing_json)
+        return {
+            str(key): {str(k): str(v) for k, v in entry.items()}
+            for key, entry in parsed.items()
+        }
 
     @model_validator(mode="after")
     def resolve_jwt_secret_key(self) -> "Settings":
