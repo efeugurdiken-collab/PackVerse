@@ -35,16 +35,16 @@ row is committed, and rolled back from storage if that commit fails.
 Deletes are soft (status + `deleted_at`) and idempotent. Still no LLM
 integration, Agents runtime, MCP, or RAG.
 
-> P1 and P2 were built in a sandboxed environment with no Docker and no
-> external network access, then verified locally by the maintainer -
-> Docker, PostgreSQL, the health endpoint, Alembic upgrade/downgrade,
-> pytest (20 passed), ruff, and mypy all passed. Sprint P3 was written
-> the same way, then also verified locally (58 passed, mypy clean across
-> 39 source files). Sprint P4 was written and statically validated
-> (`python -m py_compile`, not executed) the same way P1-P3 originally
-> were, in an environment with no Docker and no network access, and
-> needs the same local verification pass before merging - see
-> [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md).
+> P1-P4 were all written in a sandboxed environment with no Docker and
+> no external network access, then verified locally by the maintainer.
+> P1/P2: pytest (20 passed), ruff, mypy all passed. P3: 58 passed, mypy
+> clean across 39 source files. P4: 129 passed (2 pre-existing Starlette
+> deprecation warnings, not failures), ruff clean, mypy clean across 47
+> source files - after two follow-up fixes caught by real local runs (a
+> missing `pathlib` import, and a `MissingGreenlet`/SQLAlchemy
+> identity-map bug in one rollback test). See
+> [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md) for
+> the full history and exact reproduction steps.
 
 ## Tech Stack
 
@@ -292,16 +292,13 @@ Each test gets its own database transaction (via `tests/conftest.py`'s
 pass regardless of execution order and don't need to be run with
 `-p no:randomly` or similar.
 
-**Sandbox note:** the P1/P2/P3 portions of this suite have since been run
-and passed locally (58 tests, see the CTO approval history). The Sprint
-P4 additions (`test_storage_local.py`, `test_storage_s3.py`,
-`test_assets_api.py`, the storage-related tests added to
-`test_config.py`, and the P4 portions of `test_migrations.py`) were
-written and statically validated (`python -m py_compile`) the same way
-P1-P3 originally were - in an environment with no Docker and no network
-access - so they have not actually been executed yet. See
+**Sandbox note:** the full suite (P1-P4) has since been run and passed
+locally - 129 tests, 2 pre-existing Starlette deprecation warnings (not
+failures), ruff clean, mypy clean across 47 source files. See
 [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md) for
-exact commands, expected output, and troubleshooting.
+exact commands, expected output, the full verification history, and the
+two follow-up fixes (`9214d51`, `2d7a5e1`) that P4's real local run
+caught.
 
 ## Rules
 
@@ -316,7 +313,7 @@ exact commands, expected output, and troubleshooting.
 1. Backend foundation - **P1, verified locally, CTO approved**
 2. Database and domain models - **P2, verified locally, CTO approved**
 3. Authentication & RBAC - **P3, verified locally, CTO approved**
-4. Storage - **P4, built, local verification pending**
+4. Storage - **P4, verified locally, awaiting CTO approval to start P5**
 5. LLM Gateway
 6. AI Runtime
 7. MCP Integration

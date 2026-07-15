@@ -1,12 +1,13 @@
 # Local Verification (P1-P4)
 
-**Status: P1, P2, P3 verified locally and CTO-approved. P4 pending.**
-Parts A and B below (P1/P2) and the CTO approval history for P3 are
-historical record of runs already completed against a real PostgreSQL
-instance. Part D (P4) has not been executed anywhere - this document
-exists because the environment this code was written in cannot run it,
-and the CTO instruction for every sprint in this repo has been explicit:
-do not claim a sprint passed, and give exact reproducible steps instead.
+**Status: P1, P2, P3, P4 verified locally.** Parts A, B, and D below
+are historical record of runs already completed against a real
+PostgreSQL instance (P4 required two follow-up fixes - a missing
+`pathlib` import and a `MissingGreenlet`/identity-map test bug, both
+resolved and re-verified). This document exists because the environment
+this code was written in cannot run it, and the CTO instruction for
+every sprint in this repo has been explicit: do not claim a sprint
+passed, and give exact reproducible steps instead.
 
 ## Why verification could not run here
 
@@ -206,7 +207,21 @@ source files", `git status` clean at commit `ee9e360`.
 
 ## Part D — Sprint P4 (Storage Layer)
 
-**Not yet run anywhere.** Same reset discipline as Part C applies: run
+**Verified.** Final confirmed result: `129 passed, 2 warnings` (pytest),
+`All checks passed!` (ruff), `Success: no issues found in 47 source
+files` (mypy). The two warnings are pre-existing Starlette deprecation
+notices (`HTTP_422_UNPROCESSABLE_ENTITY` / `HTTP_413_REQUEST_ENTITY_TOO_LARGE`
+renamed upstream) - not failures, not introduced by this sprint.
+
+Two issues were found and fixed during verification before this final
+pass: a missing `from pathlib import Path` in `tests/conftest.py`
+(commit `9214d51`), and a `MissingGreenlet`/SQLAlchemy-identity-map bug
+in `test_database_rollback_removes_stored_object` caused by reading an
+ORM attribute after the service layer's own rollback expired it -
+fixed in the test only, not the service layer, which was already
+correct (commit `2d7a5e1`).
+
+Same reset discipline as Part C applies: run
 `docker compose down` then `docker compose up --build -d` first, so the
 newly added `boto3`/`python-multipart` dependencies and the
 `packverse_storage` volume actually exist before testing.
@@ -297,8 +312,8 @@ ls backend/data/storage/products/  # confirm the file actually landed on disk
 
 ## Acceptance (P4)
 
-Sprint P4 is only complete once every command in Part D has been run
-against a real PostgreSQL instance and object storage volume, and
-produced the expected output above. Until then, treat all P4 code as
-**unverified**. Per CTO instruction: do not start Sprint P5 (LLM
-Gateway) until this verification passes and is explicitly approved.
+All commands in Part D have been run against a real PostgreSQL instance
+and object storage volume and produced the expected output (`129
+passed`, ruff clean, mypy clean on 47 source files). Per CTO
+instruction: Sprint P5 (LLM Gateway) still does not start until this is
+explicitly approved.
