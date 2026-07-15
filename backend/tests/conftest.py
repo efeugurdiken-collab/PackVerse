@@ -31,8 +31,12 @@ from app.core.security import create_access_token, hash_password
 from app.database.session import get_db
 from app.main import app
 from app.models import Base
-from app.models.enums import UserRole, UserStatus
+from app.models.enums import ProductStatus, ProductType, UserRole, UserStatus
+from app.models.product import Product
 from app.models.user import User
+from app.storage.base import StorageBackend
+from app.storage.factory import get_storage_backend
+from app.storage.local import LocalStorageBackend
 
 settings = get_settings()
 
@@ -90,14 +94,33 @@ async def db_session(test_engine: AsyncEngine) -> AsyncGenerator[AsyncSession, N
 
 
 @pytest.fixture
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
-    """An HTTP client whose requests use the isolated db_session above,
-    via a FastAPI dependency override."""
+def storage_backend(tmp_path: Path) -> StorageBackend:
+    """A LocalStorageBackend rooted in pytest's per-test tmp_path.
+
+    Deliberately never the real, process-wide
+    app.storage.factory.get_storage_backend() singleton - that one is
+    @lru_cache-d and points at settings.storage_local_root (the real
+    ./data/storage volume). Tests must never read or write there, so the
+    `client` fixture below overrides the FastAPI dependency with this
+    isolated instance instead, the same way it overrides get_db."""
+    return LocalStorageBackend(str(tmp_path / "storage"))
+
+
+@pytest.fixture
+async def client(
+    db_session: AsyncSession, storage_backend: StorageBackend
+) -> AsyncGenerator[AsyncClient, None]:
+    """An HTTP client whose requests use the isolated db_session and
+    storage_backend above, via FastAPI dependency overrides."""
 
     async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
 
+    def _override_get_storage_backend() -> StorageBackend:
+        return storage_backend
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_storage_backend] = _override_get_storage_backend
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -135,6 +158,37 @@ def make_user(
         return user
 
     return _make_user
+
+
+@pytest.fixture
+def make_product(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[Product]]:
+    """Factory fixture: `await make_product()` inserts a Product directly
+    via the ORM and returns it - asset tests need an existing product to
+    attach uploads to, but exercising the full Product API for that setup
+    (as test_authorization.py does) would couple every asset test to
+    Sprint P3's endpoint behavior unnecessarily."""
+
+    async def _make_product(
+        *,
+        slug: str | None = None,
+        title: str = "Test Product",
+        product_type: ProductType = ProductType.PROMPT_PACK,
+        status: ProductStatus = ProductStatus.DRAFT,
+    ) -> Product:
+        product = Product(
+            slug=slug or f"product-{uuid.uuid4().hex[:10]}",
+            title=title,
+            product_type=product_type,
+            status=status,
+        )
+        db_session.add(product)
+        await db_session.commit()
+        await db_session.refresh(product)
+        return product
+
+    return _make_product
 
 
 @pytest.fixture

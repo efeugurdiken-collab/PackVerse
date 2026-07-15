@@ -1,9 +1,12 @@
-# P1 + P2 Local Verification
+# Local Verification (P1-P4)
 
-**Status: Pending.** Nothing in this repository has been executed. This
-document exists because the environment this code was written in cannot
-run it, and the CTO instruction for this sprint was explicit: do not
-claim P1 passed, and give exact reproducible steps instead.
+**Status: P1, P2, P3 verified locally and CTO-approved. P4 pending.**
+Parts A and B below (P1/P2) and the CTO approval history for P3 are
+historical record of runs already completed against a real PostgreSQL
+instance. Part D (P4) has not been executed anywhere - this document
+exists because the environment this code was written in cannot run it,
+and the CTO instruction for every sprint in this repo has been explicit:
+do not claim a sprint passed, and give exact reproducible steps instead.
 
 ## Why verification could not run here
 
@@ -173,8 +176,129 @@ in the flagged file, not a config problem to loosen.
   editing would break the `TYPE_CHECKING`-only import pattern used
   there.
 
-## Acceptance
+## Acceptance (P1/P2)
 
 Sprint P2 is only complete once every command in Part A and Part B has
 been run against a real PostgreSQL instance and produced the expected
-output above. Until then, treat all P1 and P2 code as **unverified**.
+output above. This has since happened - see the CTO approval history
+for the actual pasted output (20 passed, mypy clean on 32 source files).
+
+## Part C — Sprint P3 (Authentication + RBAC)
+
+Verified locally by the CTO after one reset-and-retry (an initial paste
+of output was numerically identical to the pre-P3 baseline and was
+correctly rejected as stale). The commands are the same shape as Part B
+step 3/4 above, run after `docker compose down` + `docker compose up
+--build -d` to guarantee a fresh container with the newly added
+dependencies (`argon2-cffi`, `pyjwt`, `email-validator`) actually
+installed:
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current   # -> 1f20f57819a3 (head)
+docker compose exec backend pytest -v
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Confirmed result: `58 passed`, `mypy`: "Success: no issues found in 39
+source files", `git status` clean at commit `ee9e360`.
+
+## Part D — Sprint P4 (Storage Layer)
+
+**Not yet run anywhere.** Same reset discipline as Part C applies: run
+`docker compose down` then `docker compose up --build -d` first, so the
+newly added `boto3`/`python-multipart` dependencies and the
+`packverse_storage` volume actually exist before testing.
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current            # -> ae14cc314d2f (head)
+docker compose exec backend alembic downgrade -1        # drops only the 7 P4 columns on assets
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `ae14cc314d2f (head)` after the first upgrade; the `downgrade
+-1` step removes `original_filename`, `content_type`, `etag`,
+`storage_backend`, `status`, `uploaded_by_user_id`, `deleted_at` from
+`assets` while every P2/P3 table and column stays intact (spot-check
+with `docker compose exec db psql -U packverse -d packverse -c '\d assets'`);
+the final `downgrade base` / `upgrade head` pair proves the whole chain
+still runs cleanly end to end.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_storage_local.py`, `test_storage_s3.py`,
+and `test_assets_api.py` passes, plus the storage-related additions to
+`test_config.py` and the P4 additions to `test_migrations.py`, on top of
+all P1-P3 tests continuing to pass unmodified (regression). Roughly 58
+(P1-P3 baseline) + ~55 new P4 tests.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` → "All checks passed!"; `mypy app` → "Success: no
+issues found in N source files" where N is larger than P3's 39 (new
+files: `app/storage/{__init__,base,exceptions,local,s3,factory}.py`,
+`app/models/asset.py` changes, `app/schemas/asset.py`,
+`app/services/asset_service.py`, `app/api/v1/assets.py`).
+
+### 4. Manual smoke test (optional but recommended)
+
+```bash
+# register + login to get a token, or reuse one from P3 testing
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+PRODUCT_ID=$(curl -s -X POST http://localhost:8000/api/v1/products \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"slug":"smoke-test","title":"Smoke Test","product_type":"svg_pack","price_cents":0,"currency":"USD","metadata_json":{}}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+
+curl -X POST http://localhost:8000/api/v1/products/$PRODUCT_ID/assets \
+  -H "Authorization: Bearer $TOKEN" -F "file=@./some-test-file.png"
+
+ls backend/data/storage/products/  # confirm the file actually landed on disk
+```
+
+### If it fails
+
+- **`alembic downgrade -1` errors on dropping the FK constraint**: check
+  that the constraint name in the downgrade matches exactly what the
+  upgrade created (`fk_assets_uploaded_by_user_id_users`) - PostgreSQL
+  is case-sensitive here and a typo would fail loudly, not silently.
+- **Uploads succeed but `docker compose exec backend ls data/storage`
+  shows nothing**: confirm the `packverse_storage` named volume is
+  actually mounted at `/app/data/storage` per `docker-compose.yml`, and
+  that `STORAGE_LOCAL_ROOT` wasn't overridden to point somewhere else.
+- **`test_assets_api.py` failures around the `client`/`storage_backend`
+  fixtures**: this is the one piece of P4 test infrastructure that could
+  not be exercised at all in the sandbox (no pytest-asyncio, no real
+  filesystem writes were verified) - treat failures here as a
+  legitimate implementation issue to report, not a fixture typo to
+  silently patch around.
+- **`mypy` failures in `app/storage/s3.py`**: confirm `boto3-stubs[s3]`
+  actually installed (`pip show boto3-stubs` inside the container) -
+  without it, `boto3.client("s3")` has no useful stub and mypy may
+  report spurious `Any`-related strict-mode errors.
+
+## Acceptance (P4)
+
+Sprint P4 is only complete once every command in Part D has been run
+against a real PostgreSQL instance and object storage volume, and
+produced the expected output above. Until then, treat all P4 code as
+**unverified**. Per CTO instruction: do not start Sprint P5 (LLM
+Gateway) until this verification passes and is explicitly approved.

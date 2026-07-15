@@ -42,3 +42,56 @@ class InvalidCredentialsError(DomainError):
 
     def __init__(self) -> None:
         super().__init__("invalid credentials")
+
+
+# --- Asset / upload domain errors (Sprint P4) ---
+# Deliberately generic messages: none of these include the storage key,
+# filesystem path, bucket name, or any storage credential - see the
+# Security rule against leaking internal storage details through error
+# responses. app/api/v1/assets.py maps each to a specific HTTP status.
+
+
+class AssetNotFoundError(DomainError):
+    def __init__(self, asset_id: object) -> None:
+        super().__init__(f"Asset {asset_id} not found")
+        self.asset_id = asset_id
+
+
+class AssetDeletedError(DomainError):
+    def __init__(self, asset_id: object) -> None:
+        super().__init__(f"Asset {asset_id} has been deleted")
+        self.asset_id = asset_id
+
+
+class UnsupportedFileTypeError(DomainError):
+    def __init__(self, content_type: str) -> None:
+        super().__init__(f"Unsupported file type: {content_type!r}")
+        self.content_type = content_type
+
+
+class FileTooLargeError(DomainError):
+    def __init__(self, size_bytes: int, max_bytes: int) -> None:
+        super().__init__(f"File too large: {size_bytes} bytes (maximum {max_bytes})")
+        self.size_bytes = size_bytes
+        self.max_bytes = max_bytes
+
+
+class EmptyFileError(DomainError):
+    def __init__(self) -> None:
+        super().__init__("Uploaded file is empty")
+
+
+class InvalidFilenameError(DomainError):
+    def __init__(self, filename: str) -> None:
+        super().__init__("Uploaded filename is invalid")
+        self.filename = filename
+
+
+class AssetStorageOperationFailedError(DomainError):
+    """Wraps a lower-level app.storage.exceptions.StorageError so the API
+    layer only ever needs to catch domain errors, never reach into the
+    storage layer's own exception types directly."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"Storage {operation} failed")
+        self.operation = operation

@@ -58,6 +58,33 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     min_password_length: int = 12
 
+    # --- Storage (Sprint P4) ---
+    storage_backend: str = "local"  # local | s3
+    storage_local_root: str = "./data/storage"
+
+    s3_endpoint_url: str | None = None
+    s3_bucket: str | None = None
+    s3_region: str | None = None
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: str | None = None
+    s3_use_ssl: bool = True
+    s3_force_path_style: bool = False
+
+    max_upload_size_bytes: int = 26_214_400  # 25 MiB
+    # Comma-separated; see allowed_mime_types_list for the parsed form.
+    # Deliberately narrow default allowlist - product asset types actually
+    # produced by the vault's 07 Products/ lines (images, SVGs, PDFs,
+    # zipped packs, fonts, STL binaries) plus common web-safe formats.
+    # Do not add application/x-msdownload, application/x-executable, or
+    # similar - see the File Validation security rule against silently
+    # accepting arbitrary executables.
+    allowed_mime_types: str = (
+        "image/png,image/jpeg,image/webp,image/svg+xml,"
+        "application/pdf,application/zip,application/json,"
+        "font/ttf,font/otf,"
+        "model/stl,application/sla,application/octet-stream"
+    )
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:
@@ -65,6 +92,41 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(f"environment must be one of {allowed}, got {v!r}")
         return v
+
+    @field_validator("storage_backend")
+    @classmethod
+    def validate_storage_backend(cls, v: str) -> str:
+        allowed = {"local", "s3"}
+        if v not in allowed:
+            raise ValueError(f"storage_backend must be one of {allowed}, got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_s3_settings_when_selected(self) -> "Settings":
+        """Fails fast (at startup, in every environment - not just
+        production) if STORAGE_BACKEND=s3 but any mandatory S3 setting is
+        missing, rather than deferring the failure to the first upload."""
+        if self.storage_backend != "s3":
+            return self
+
+        required = {
+            "S3_ENDPOINT_URL": self.s3_endpoint_url,
+            "S3_BUCKET": self.s3_bucket,
+            "S3_REGION": self.s3_region,
+            "S3_ACCESS_KEY_ID": self.s3_access_key_id,
+            "S3_SECRET_ACCESS_KEY": self.s3_secret_access_key,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(
+                f"STORAGE_BACKEND=s3 requires {', '.join(missing)} to be set - "
+                "none of these are auto-generated or defaulted."
+            )
+        return self
+
+    @property
+    def allowed_mime_types_list(self) -> list[str]:
+        return [t.strip() for t in self.allowed_mime_types.split(",") if t.strip()]
 
     @model_validator(mode="after")
     def resolve_jwt_secret_key(self) -> "Settings":

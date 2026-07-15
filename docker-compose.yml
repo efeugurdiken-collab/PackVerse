@@ -41,6 +41,14 @@ services:
       # values already in it (docker-compose sets those directly as
       # container env vars, which take priority over reading the file).
       - ./.env:/app/.env
+      # Local storage backend's root (Sprint P4) - a named volume, not a
+      # bind mount, since uploaded files are app data, not source: this
+      # keeps them out of the host's backend/ tree entirely (nothing to
+      # accidentally git add) while still persisting across container
+      # restarts. STORAGE_LOCAL_ROOT=./data/storage resolves to /app/data/storage
+      # inside the container, which is exactly where this volume is mounted.
+      - packverse_storage:/app/data/storage
 
 volumes:
   packverse_pgdata:
+  packverse_storage:

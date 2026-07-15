@@ -63,3 +63,29 @@ class UserStatus(str, Enum):
     PENDING = "pending"
     ACTIVE = "active"
     DISABLED = "disabled"
+
+
+class AssetStatus(str, Enum):
+    """Lifecycle of a single asset upload (Sprint P4).
+
+    PENDING is set the instant the database row is created, before the
+    storage write is attempted; the upload endpoint flips it to
+    AVAILABLE only after the storage backend confirms the write
+    succeeded, or to FAILED (row kept for auditability, not deleted) if
+    it didn't. DELETED is a soft-delete marker - see Asset.deleted_at.
+    """
+
+    PENDING = "pending"
+    AVAILABLE = "available"
+    FAILED = "failed"
+    DELETED = "deleted"
+
+
+class StorageProvider(str, Enum):
+    """Which storage backend a given asset's bytes actually live in -
+    recorded per-row (not read from current app config) so that assets
+    uploaded under one backend stay retrievable by key even after the
+    deployment's default STORAGE_BACKEND setting changes later."""
+
+    LOCAL = "local"
+    S3 = "s3"

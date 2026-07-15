@@ -80,3 +80,56 @@ def test_persist_helper_returns_false_when_file_missing(tmp_path) -> None:
     missing_path = tmp_path / "does-not-exist" / ".env"
     wrote = _persist_dev_secret_to_env_file("some-secret", env_path=missing_path)
     assert wrote is False
+
+
+# --- Storage settings (Sprint P4) --------------------------------------
+
+
+def test_storage_backend_defaults_to_local() -> None:
+    settings = Settings(environment="development")
+    assert settings.storage_backend == "local"
+
+
+def test_storage_backend_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="storage_backend must be one of"):
+        Settings(environment="development", storage_backend="dropbox")
+
+
+def test_s3_backend_without_required_settings_raises() -> None:
+    with pytest.raises(ValidationError, match="requires"):
+        Settings(environment="development", storage_backend="s3")
+
+
+def test_s3_backend_reports_all_missing_fields() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            environment="development",
+            storage_backend="s3",
+            s3_bucket="my-bucket",
+        )
+    message = str(exc_info.value)
+    assert "S3_ENDPOINT_URL" in message
+    assert "S3_REGION" in message
+    assert "S3_ACCESS_KEY_ID" in message
+    assert "S3_SECRET_ACCESS_KEY" in message
+    assert "S3_BUCKET" not in message  # this one was provided
+
+
+def test_s3_backend_with_all_required_settings_boots() -> None:
+    settings = Settings(
+        environment="development",
+        storage_backend="s3",
+        s3_endpoint_url="https://s3.example.com",
+        s3_bucket="my-bucket",
+        s3_region="us-east-1",
+        s3_access_key_id="AKIAEXAMPLE",
+        s3_secret_access_key="secret",
+    )
+    assert settings.storage_backend == "s3"
+
+
+def test_allowed_mime_types_list_parses_comma_separated_string() -> None:
+    settings = Settings(
+        environment="development", allowed_mime_types="image/png, image/jpeg,application/pdf"
+    )
+    assert settings.allowed_mime_types_list == ["image/png", "image/jpeg", "application/pdf"]
