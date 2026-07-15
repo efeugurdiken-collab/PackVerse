@@ -38,6 +38,26 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
 
+    # --- Auth (Sprint P3) ---
+    # No default: an empty/placeholder secret would silently produce
+    # forgeable tokens, so app startup must fail loudly instead. Generate
+    # with: python -c "import secrets; print(secrets.token_urlsafe(64))"
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 15
+    refresh_token_expire_days: int = 30
+    min_password_length: int = 12
+
+    @field_validator("jwt_secret_key")
+    @classmethod
+    def validate_jwt_secret_key(cls, v: str) -> str:
+        if len(v) < 32:
+            raise ValueError(
+                "jwt_secret_key must be at least 32 characters - generate one with: "
+                'python -c "import secrets; print(secrets.token_urlsafe(64))"'
+            )
+        return v
+
     @property
     def database_url(self) -> str:
         """Async SQLAlchemy connection string (asyncpg driver)."""

@@ -20,3 +20,25 @@ class DuplicateSlugError(DomainError):
     def __init__(self, slug: str) -> None:
         super().__init__(f"Product with slug {slug!r} already exists")
         self.slug = slug
+
+
+class DuplicateEmailError(DomainError):
+    def __init__(self, email: str) -> None:
+        super().__init__(f"User with email {email!r} already exists")
+        self.email = email
+
+
+class UserNotFoundError(DomainError):
+    def __init__(self, identifier: object) -> None:
+        super().__init__(f"User {identifier} not found")
+        self.identifier = identifier
+
+
+class InvalidCredentialsError(DomainError):
+    """Deliberately message-free of *why* - see app/api/v1/auth.py's login
+    endpoint, which maps this to one generic 401 regardless of whether the
+    email didn't exist, the password was wrong, or the account is
+    disabled, so failed attempts can't be used to enumerate accounts."""
+
+    def __init__(self) -> None:
+        super().__init__("invalid credentials")

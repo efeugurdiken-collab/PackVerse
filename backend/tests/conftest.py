@@ -18,7 +18,8 @@ Requires a reachable PostgreSQL instance at settings.test_database_url
 (defaults to "<postgres_db>_test"). Create it once, e.g.:
     docker compose exec db createdb -U packverse packverse_test
 """
-from collections.abc import AsyncGenerator
+import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -26,9 +27,12 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
+from app.core.security import create_access_token, hash_password
 from app.database.session import get_db
 from app.main import app
 from app.models import Base
+from app.models.enums import UserRole, UserStatus
+from app.models.user import User
 
 settings = get_settings()
 
@@ -98,3 +102,48 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def make_user(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[User]]:
+    """Factory fixture: `await make_user(role=UserRole.OPERATOR)` inserts
+    a user directly via the ORM (bypassing the /auth/register endpoint,
+    since tests need to construct users in states - e.g. DISABLED - that
+    endpoint can never produce) and returns it."""
+
+    async def _make_user(
+        *,
+        email: str | None = None,
+        password: str = "a-perfectly-fine-passw0rd",
+        role: UserRole = UserRole.VIEWER,
+        status: UserStatus = UserStatus.ACTIVE,
+        is_verified: bool = False,
+    ) -> User:
+        user = User(
+            email=email or f"user-{uuid.uuid4().hex[:10]}@example.com",
+            hashed_password=hash_password(password),
+            full_name="Test User",
+            role=role,
+            status=status,
+            is_verified=is_verified,
+        )
+        db_session.add(user)
+        await db_session.commit()
+        await db_session.refresh(user)
+        return user
+
+    return _make_user
+
+
+@pytest.fixture
+def auth_headers() -> Callable[[User], dict[str, str]]:
+    """`auth_headers(user)` -> a ready-to-use Authorization header for a
+    valid access token belonging to that user."""
+
+    def _auth_headers(user: User) -> dict[str, str]:
+        token = create_access_token(subject=user.id, role=user.role.value)
+        return {"Authorization": f"Bearer {token}"}
+
+    return _auth_headers

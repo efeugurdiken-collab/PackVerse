@@ -19,7 +19,8 @@ from alembic import command
 from alembic.config import Config
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
-REVISION = "06b17a0f30ad"
+P2_REVISION = "06b17a0f30ad"
+P3_REVISION = "1f20f57819a3"  # head as of Sprint P3
 
 EXPECTED_TABLES = {
     "products",
@@ -27,6 +28,7 @@ EXPECTED_TABLES = {
     "jobs",
     "agent_definitions",
     "workflow_definitions",
+    "users",
 }
 
 
@@ -37,7 +39,7 @@ def _alembic_config(sync_url: str) -> Config:
     return cfg
 
 
-def test_migration_upgrade_creates_all_five_tables(test_sync_database_url: str) -> None:
+def test_migration_upgrade_creates_all_six_tables(test_sync_database_url: str) -> None:
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -70,9 +72,32 @@ def test_migration_upgrade_is_idempotent_and_downgrade_is_clean(
     command.downgrade(cfg, "base")
 
 
-def test_migration_revision_identifier_matches_expected() -> None:
-    """Guards against silently renumbering the migration - Sprint P2's
-    report cites this exact revision id as the schema baseline."""
+def test_migration_revision_identifiers_match_expected() -> None:
+    """Guards against silently renumbering either migration - the Sprint
+    P2 and P3 reports cite these exact revision ids as the schema
+    history, and P3 downgrading cleanly back to P2 depends on this
+    down_revision chain staying intact."""
     versions_dir = BACKEND_ROOT / "alembic" / "versions"
-    matches = list(versions_dir.glob(f"{REVISION}_*.py"))
-    assert len(matches) == 1, f"expected exactly one migration file for {REVISION}"
+    for revision in (P2_REVISION, P3_REVISION):
+        matches = list(versions_dir.glob(f"{revision}_*.py"))
+        assert len(matches) == 1, f"expected exactly one migration file for {revision}"
+
+
+def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_url: str) -> None:
+    """P3's users table must drop on downgrade to P2 while every P2
+    domain table survives untouched - this is what 'downgrade cleanly
+    back to P2' means operationally, not just 'the command exits 0'."""
+    cfg = _alembic_config(test_sync_database_url)
+    command.upgrade(cfg, "head")
+    try:
+        command.downgrade(cfg, P2_REVISION)
+
+        engine = sa.create_engine(test_sync_database_url)
+        inspector = sa.inspect(engine)
+        table_names = set(inspector.get_table_names())
+        engine.dispose()
+
+        assert "users" not in table_names
+        assert EXPECTED_TABLES - {"users"} <= table_names
+    finally:
+        command.downgrade(cfg, "base")

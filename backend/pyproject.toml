@@ -13,6 +13,9 @@ dependencies = [
     "pydantic>=2.9.0",
     "pydantic-settings>=2.5.0",
     "python-dotenv>=1.0.1",
+    "argon2-cffi>=23.1.0",
+    "pyjwt>=2.9.0",
+    "email-validator>=2.2.0",
 ]
 
 [project.optional-dependencies]

@@ -47,3 +47,19 @@ class WorkflowStatus(str, Enum):
     DRAFT = "draft"
     ACTIVE = "active"
     DEPRECATED = "deprecated"
+
+
+class UserRole(str, Enum):
+    """Ordered least to most privileged - see app/api/deps.py's
+    require_roles() for how this ordering maps to the Product API's
+    viewer/operator/admin access matrix."""
+
+    VIEWER = "viewer"
+    OPERATOR = "operator"
+    ADMIN = "admin"
+
+
+class UserStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    DISABLED = "disabled"
