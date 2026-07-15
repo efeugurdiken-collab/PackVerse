@@ -20,6 +20,7 @@ Requires a reachable PostgreSQL instance at settings.test_database_url
 """
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
