@@ -19,7 +19,11 @@ JWT access/refresh tokens, `/api/v1/auth/*` endpoints, and authorization
 on the Product API (viewer: read-only, operator/admin: create + update).
 Still no storage, LLM integration, Agents runtime, MCP, or RAG - and no
 OAuth providers, email verification delivery, or password reset yet
-(explicitly out of scope for this sprint).
+(explicitly out of scope for this sprint). A follow-up change also made
+`JWT_SECRET_KEY` optional specifically in `ENVIRONMENT=development`: if
+it's missing there, the app generates one and appends it to `.env`
+itself rather than refusing to start - see Setup below. It remains
+mandatory (no auto-generation) for staging/production/test.
 
 > P1 and P2 were built in a sandboxed environment with no Docker and no
 > external network access, then verified locally by the maintainer -
@@ -80,10 +84,13 @@ cp .env.example .env
 # edit .env and set a real POSTGRES_PASSWORD
 ```
 
-**If you already had a `.env` from before Sprint P3**, add a real JWT
-secret to it - the app now refuses to start without one:
+JWT_SECRET_KEY can be left blank for local development - see the comment
+above it in `.env.example`. The app generates one on first boot and
+writes it back into `.env` for you (only when `ENVIRONMENT=development`;
+staging/production/test still require it set explicitly beforehand):
 
 ```bash
+# optional - only if you want to set it yourself instead of auto-generating
 python3 -c "import secrets; print(secrets.token_urlsafe(64))"
 # paste the output as JWT_SECRET_KEY= in .env
 ```
@@ -210,6 +217,7 @@ Test files:
 | `tests/test_auth.py` | Registration, login, JWT issuance/expiry/signature checks, refresh token flow |
 | `tests/test_authorization.py` | Product API's viewer/operator/admin access matrix, 401s, disabled accounts |
 | `tests/test_migrations.py` | Alembic `upgrade head` / `downgrade base` / partial downgrade to P2, table presence, revision ids |
+| `tests/test_config.py` | JWT secret policy: dev auto-generation, persistence to `.env`, never overwriting, production/staging/test failing loudly without one |
 
 Each test gets its own database transaction (via `tests/conftest.py`'s
 `db_session`/`client` fixtures) that is rolled back afterward, so tests
@@ -218,10 +226,10 @@ pass regardless of execution order and don't need to be run with
 
 **Sandbox note:** the P1/P2 portions of this suite have since been run
 and passed locally (20 tests, see the CTO approval history). The Sprint
-P3 additions (`test_auth.py`, `test_authorization.py`, and the P3
-portions of `test_migrations.py`) were written and statically validated
-(`python -m py_compile`) the same way P1/P2 originally were - in an
-environment with no Docker and no network access - so they have not
+P3 additions (`test_auth.py`, `test_authorization.py`, `test_config.py`,
+and the P3 portions of `test_migrations.py`) were written and statically
+validated (`python -m py_compile`) the same way P1/P2 originally were -
+in an environment with no Docker and no network access - so they have not
 actually been executed yet. See
 [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md) for
 exact commands, expected output, and troubleshooting.

@@ -75,7 +75,7 @@ def _create_token(
         "exp": now + expires_delta,
         "jti": str(uuid.uuid4()),
     }
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
 def create_access_token(*, subject: uuid.UUID, role: str) -> str:
@@ -109,7 +109,7 @@ def decode_token(token: str, *, expected_type: TokenType) -> dict[str, Any]:
     try:
         payload: dict[str, Any] = jwt.decode(
             token,
-            settings.jwt_secret_key,
+            settings.jwt_secret,
             algorithms=[settings.jwt_algorithm],
             options={"require": ["sub", "role", "type", "iat", "exp", "jti"]},
         )

@@ -170,7 +170,7 @@ async def test_me_with_expired_token_returns_401(client, make_user) -> None:
         "exp": int(time.time()) - 1800,
         "jti": str(uuid.uuid4()),
     }
-    expired_token = jwt.encode(expired_payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    expired_token = jwt.encode(expired_payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
     response = await client.get(f"{BASE}/me", headers={"Authorization": f"Bearer {expired_token}"})
     assert response.status_code == 401

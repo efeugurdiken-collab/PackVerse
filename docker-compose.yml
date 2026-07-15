@@ -34,6 +34,13 @@ services:
       - ./backend/app:/app/app
       - ./backend/alembic:/app/alembic
       - ./backend/tests:/app/tests
+      # Mounted as a real file (not just injected via env_file: above) so
+      # app/core/config.py's development JWT-secret auto-generation can
+      # append JWT_SECRET_KEY back to the host's .env - see Sprint P3's
+      # JWT-Development-Automation change. env_file: still wins for the
+      # values already in it (docker-compose sets those directly as
+      # container env vars, which take priority over reading the file).
+      - ./.env:/app/.env
 
 volumes:
   packverse_pgdata:
