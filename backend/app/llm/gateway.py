@@ -132,7 +132,7 @@ class LLMGateway:
                 continue
             try:
                 results.append(await provider.health_check())
-            except Exception as exc:  # noqa: broad on purpose - see docstring
+            except Exception as exc:  # broad on purpose - see docstring above
                 results.append(
                     ProviderHealth(provider=name, status="unavailable", detail=str(exc))
                 )

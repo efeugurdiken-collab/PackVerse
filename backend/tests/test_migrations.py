@@ -87,9 +87,14 @@ def test_migration_revision_identifiers_match_expected() -> None:
 
 
 def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_url: str) -> None:
-    """P3's users table must drop on downgrade to P2 while every P2
-    domain table survives untouched - this is what 'downgrade cleanly
-    back to P2' means operationally, not just 'the command exits 0'."""
+    """P3's users table and P5's llm_requests table must both drop on
+    downgrade to P2 while every P2 domain table survives untouched -
+    this is what 'downgrade cleanly back to P2' means operationally, not
+    just 'the command exits 0'. Neither users nor llm_requests existed
+    at P2, so both must be excluded from the post-downgrade expectation
+    - EXPECTED_TABLES itself always reflects the current head (P5) and
+    must not be used unmodified as the expected state at an earlier
+    revision."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -101,7 +106,8 @@ def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_ur
         engine.dispose()
 
         assert "users" not in table_names
-        assert EXPECTED_TABLES - {"users"} <= table_names
+        assert "llm_requests" not in table_names
+        assert EXPECTED_TABLES - {"users", "llm_requests"} <= table_names
     finally:
         command.downgrade(cfg, "base")
 
@@ -109,11 +115,13 @@ def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_ur
 def test_migration_downgrade_to_p4_removes_only_p4_columns(
     test_sync_database_url: str,
 ) -> None:
-    """Downgrading from head (P5) to P4 must remove exactly the P4
-    columns added to assets and nothing else - the P3 users table and
-    every column that existed before P4 must survive untouched. Uses the
-    explicit P4_REVISION target (not "-1") since head no longer *is* P4
-    as of Sprint P5 - see test_migration_downgrade_one_step_from_head_
+    """Downgrading from head (P5) to the explicit P4_REVISION target
+    stops right after P4's own migration - P4 stays fully applied, only
+    Sprint P5's addition (the llm_requests table) is undone. So the P4
+    columns on assets, and the P3 users table, must all still be
+    present; only llm_requests must be gone. Uses the explicit
+    P4_REVISION target (not "-1") since head no longer *is* P4 as of
+    Sprint P5 - see test_migration_downgrade_one_step_from_head_
     removes_only_llm_requests_table for the "-1 from current head" case."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
@@ -131,7 +139,7 @@ def test_migration_downgrade_to_p4_removes_only_p4_columns(
         assert EXPECTED_TABLES - {"llm_requests"} <= table_names
         assert "llm_requests" not in table_names
 
-        p4_only_columns = {
+        p4_columns = {
             "original_filename",
             "content_type",
             "etag",
@@ -140,7 +148,9 @@ def test_migration_downgrade_to_p4_removes_only_p4_columns(
             "uploaded_by_user_id",
             "deleted_at",
         }
-        assert asset_columns.isdisjoint(p4_only_columns)
+        # P4 is still fully applied at this target revision - these
+        # columns must survive, not disappear.
+        assert p4_columns <= asset_columns
 
         pre_p4_columns = {
             "id", "product_id", "asset_type", "filename", "storage_key",
