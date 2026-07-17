@@ -33,9 +33,17 @@ from app.database.session import get_db
 from app.main import app
 from app.models import Base
 from app.models.agent_definition import AgentDefinition
-from app.models.enums import AgentStatus, ProductStatus, ProductType, UserRole, UserStatus
+from app.models.enums import (
+    AgentStatus,
+    ProductStatus,
+    ProductType,
+    UserRole,
+    UserStatus,
+    WorkflowStatus,
+)
 from app.models.product import Product
 from app.models.user import User
+from app.models.workflow_definition import WorkflowDefinition
 from app.storage.base import StorageBackend
 from app.storage.factory import get_storage_backend
 from app.storage.local import LocalStorageBackend
@@ -229,6 +237,48 @@ def make_agent_definition(
         return agent
 
     return _make_agent_definition
+
+
+@pytest.fixture
+def make_workflow_definition(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[WorkflowDefinition]]:
+    """Factory fixture: `await make_workflow_definition(steps=[...])`
+    inserts a WorkflowDefinition directly via the ORM and returns it -
+    there is no WorkflowDefinition CRUD API in this codebase (same
+    "seeded from the vault" reasoning as make_agent_definition above), so
+    Sprint P7's workflow tests need this the same way P6's tests needed
+    make_agent_definition. `steps` must already follow
+    app/workflows/definition.py's convention (a list of step dicts with
+    step_id/name/agent_definition_id/order and optional input_mapping) -
+    the fixture only wraps it as {"steps": [...]} and does not validate
+    it, so tests can also use this to construct deliberately-invalid
+    definitions for parse_workflow_steps/service-layer error tests. Pass
+    definition_json directly instead of steps for full control (e.g. a
+    non-dict/missing "steps" key)."""
+
+    async def _make_workflow_definition(
+        *,
+        name: str | None = None,
+        version: str = "v1.0",
+        status: WorkflowStatus = WorkflowStatus.ACTIVE,
+        steps: list[dict[str, object]] | None = None,
+        definition_json: dict[str, object] | None = None,
+    ) -> WorkflowDefinition:
+        workflow = WorkflowDefinition(
+            name=name or f"workflow-{uuid.uuid4().hex[:10]}",
+            version=version,
+            status=status,
+            definition_json=(
+                definition_json if definition_json is not None else {"steps": steps or []}
+            ),
+        )
+        db_session.add(workflow)
+        await db_session.commit()
+        await db_session.refresh(workflow)
+        return workflow
+
+    return _make_workflow_definition
 
 
 @pytest.fixture

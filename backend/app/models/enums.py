@@ -115,3 +115,38 @@ class AgentRunStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class WorkflowRunStatus(str, Enum):
+    """Lifecycle of a single WorkflowDefinition execution (Sprint P7:
+    Workflow Orchestration) - the same five states as AgentRunStatus,
+    with the same transition shape, enforced by
+    app/workflows/models.py's state machine. Deliberately a separate
+    enum, not a reuse of AgentRunStatus, so the two lifecycles can evolve
+    independently (e.g. cancel semantics already differ - see
+    app/workflows/service.py's cancel_run)."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowStepRunStatus(str, Enum):
+    """Lifecycle of a single step within a WorkflowRun (Sprint P7).
+    PENDING rows for every step are created up front, at workflow-run
+    creation time, before any step executes - see
+    app/workflows/service.py's create_workflow_run. SKIPPED is reserved
+    for steps that never ran because an earlier step failed; CANCELLED
+    is reserved for steps that never ran because the workflow run itself
+    was explicitly cancelled - the two are kept distinct rather than
+    collapsed into one "didn't run" status, since they have different
+    causes worth distinguishing in the API response."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"

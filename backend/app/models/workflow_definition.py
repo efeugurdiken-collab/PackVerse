@@ -1,9 +1,12 @@
 """WorkflowDefinition model - the persisted, versioned config for a Workflow.
 
 Corresponds to the Workflow specifications in the PackVerse OS vault
-(06 Workflows/). Populated starting with the Product Factory sprint (P9),
-which executes workflows by reading their definition_json rather than
-hardcoding each workflow's step sequence.
+(06 Workflows/). Sprint P7 (Workflow Orchestration) is the first sprint
+to actually execute these, by reading an ordered "steps" list out of
+definition_json - see app/workflows/definition.py for the exact
+convention - rather than hardcoding each workflow's step sequence. (An
+earlier note here said this would start at the Product Factory sprint,
+P9; P7 moved orchestration earlier than originally planned.)
 """
 from __future__ import annotations
 

@@ -1,16 +1,21 @@
-# Local Verification (P1-P6)
+# Local Verification (P1-P7)
 
-**Status: P1, P2, P3, P4, P5 verified locally. P6 not yet verified.**
-Parts A, B, D, and E below are historical record of runs already
-completed against a real PostgreSQL instance (P4 required two follow-up
-fixes - a missing `pathlib` import and a `MissingGreenlet`/identity-map
-test bug; P5 required two more - an invalid `noqa` directive and two
-stale/inverted migration-test assertions - all four resolved and
-re-verified). Part F below is the reproduction guide for Sprint P6,
-awaiting its first real local run. This document exists because the
-environment this code was written in cannot run it, and the CTO
-instruction for every sprint in this repo has been explicit: do not
-claim a sprint passed, and give exact reproducible steps instead.
+**Status: P1, P2, P3, P4, P5 verified locally. P6 and P7 not yet
+verified.** Parts A, B, D, and E below are historical record of runs
+already completed against a real PostgreSQL instance (P4 required two
+follow-up fixes - a missing `pathlib` import and a `MissingGreenlet`/
+identity-map test bug; P5 required two more - an invalid `noqa`
+directive and two stale/inverted migration-test assertions - all four
+resolved and re-verified). Part F is the reproduction guide for Sprint
+P6; Part G is the reproduction guide for Sprint P7 - both await their
+first real local run. Per explicit CTO instruction, P7 was implemented
+immediately after P6 without waiting for P6's own verification first, so
+both are outstanding simultaneously - Part G's steps assume Part F's
+migration/upgrade steps have already been run (P7's migration chains
+directly off P6's). This document exists because the environment this
+code was written in cannot run it, and the CTO instruction for every
+sprint in this repo has been explicit: do not claim a sprint passed, and
+give exact reproducible steps instead.
 
 ## Why verification could not run here
 
@@ -592,5 +597,147 @@ above has been run against a real PostgreSQL instance and produced the
 expected output, update this section (and the README's Roadmap/status
 blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
 hash, the same way every prior part was updated after its first real
-run. Per CTO instruction: Sprint P7 (MCP Integration) does not start
-until this is explicitly approved.
+run. Per explicit CTO instruction, Sprint P7 (Workflow Orchestration)
+was implemented immediately after P6 without waiting for this
+verification - see Part G below - but Sprint P8 does not start until
+both P6 and P7 are explicitly approved.
+
+## Part G — Sprint P7 (Workflow Orchestration)
+
+**Not yet verified.** Written and statically validated
+(`python -m py_compile` across `app/` and `tests/`, no runtime
+execution) in the same no-Docker, no-network sandbox as every prior
+sprint, immediately after P6 per explicit CTO instruction to proceed
+without waiting for P6's own verification. Needs a real local run before
+it can be marked verified - same discipline as every prior part: don't
+accept a claimed pass without actual pasted command output,
+cross-checked numerically against a baseline before trusting a delta.
+Because P6 is also still unverified, this run should apply Part F's
+steps first (or simply run `alembic upgrade head`, which chains through
+both migrations) before proceeding below.
+
+Same reset discipline as prior parts applies: run `docker compose down`
+then `docker compose up --build -d` first, so the container picks up
+the new `app/workflows/` package and `workflow_runs`/`workflow_step_runs`
+migration cleanly. No new third-party dependencies were added this
+sprint.
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current              # -> d4e6b9a3f1c7 (head)
+docker compose exec backend alembic downgrade -1          # drops workflow_runs + workflow_step_runs only
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade a1c8f7d2b3e9   # back to P6 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade 7c19e4b8a2d6   # back to P5 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `d4e6b9a3f1c7 (head)` after the first upgrade; the `downgrade
+-1` step removes only `workflow_runs` and `workflow_step_runs` while
+every P2-P6 table and column stays intact (spot-check with
+`docker compose exec db psql -U packverse -d packverse -c '\dt'` -
+`workflow_runs`/`workflow_step_runs` should be the only tables to
+disappear, and `agent_runs`/`llm_requests` should still be present); the
+final `downgrade base` / `upgrade head` pair proves the whole six-
+migration chain still runs cleanly end to end.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_workflow_models.py`,
+`test_workflow_definition.py`, `test_workflow_input_builder.py`,
+`test_workflow_service.py`, `test_workflow_executor.py`, and
+`test_workflow_run_api.py` passes, plus the P7 additions to
+`test_migrations.py`, on top of all P1-P6 tests continuing to pass
+unmodified (regression). Roughly 218 (P1-P5 baseline) + ~65 P6 tests +
+~102 new P7 tests. No test in this sprint makes a real network call -
+every workflow executor/API test routes through the `fake` LLM provider,
+same as P6's own tests.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` → "All checks passed!"; `mypy app` → "Success: no
+issues found in N source files" where N is larger than P6's count (new
+files: `app/workflows/{__init__,exceptions,models,definition,input_builder,service,executor}.py`,
+`app/models/workflow_run.py`, `app/models/workflow_step_run.py`,
+`app/schemas/workflow_run.py`, `app/api/v1/workflow_runs.py`).
+
+### 4. Manual smoke test (optional but recommended, no API key needed)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# There is no AgentDefinition or WorkflowDefinition CRUD API - seed both directly:
+docker compose exec db psql -U packverse -d packverse -c \
+  "INSERT INTO agent_definitions (id, name, role, version, status, configuration_json, created_at, updated_at) VALUES (gen_random_uuid(), 'smoke-test-agent', 'Tester', 'v1.0', 'active', '{\"system_prompt\": \"You are helpful.\", \"model\": \"fake-v1\"}', now(), now()) RETURNING id;"
+# copy the returned id into AGENT_ID below
+
+docker compose exec db psql -U packverse -d packverse -c \
+  "INSERT INTO workflow_definitions (id, name, version, status, definition_json, created_at, updated_at) VALUES (gen_random_uuid(), 'smoke-test-workflow', 'v1.0', 'active', '{\"steps\": [{\"step_id\": \"only\", \"name\": \"Only\", \"agent_definition_id\": \"$AGENT_ID\", \"order\": 1}]}', now(), now()) RETURNING id;"
+# copy the returned id into WORKFLOW_ID below
+
+curl -s -X POST http://localhost:8000/api/v1/workflow-runs \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"workflow_id":"'"$WORKFLOW_ID"'","user_input":"hello"}'
+
+curl -s http://localhost:8000/api/v1/workflow-runs -H "Authorization: Bearer $TOKEN"
+```
+
+Expected: the `POST /workflow-runs` call returns `201` with
+`"status":"completed"` and an `output_text` field (the fake provider's
+deterministic echo); `GET /workflow-runs` lists it; `GET
+/workflow-runs/{id}/steps` shows one `completed` step with a matching
+`output_text` and a non-null `agent_run_id`.
+
+### If it fails
+
+- **`alembic downgrade -1` from head errors on dropping the FK
+  constraint**: check that the constraint name matches exactly what the
+  upgrade created (`fk_workflow_step_runs_workflow_run_id_workflow_runs`
+  / `fk_workflow_step_runs_agent_id_agent_definitions` /
+  `fk_workflow_step_runs_agent_run_id_agent_runs` /
+  `fk_workflow_runs_workflow_id_workflow_definitions` /
+  `fk_workflow_runs_created_by_user_id_users`) - PostgreSQL is
+  case-sensitive here. `workflow_step_runs` must be dropped before
+  `workflow_runs` (its FK cascades from the parent).
+- **`test_workflow_executor.py` failures around step outputs/timestamps**:
+  confirm the run actually reached `COMPLETED` (check the failing step's
+  `error_code` first) - a routing/config issue upstream in the LLM
+  Gateway settings (same as P6) would surface here as a `FAILED` step
+  rather than a missing-field error.
+- **`test_workflow_run_api.py` failures around dependency overrides**:
+  same shape as `test_runtime_api.py` - confirm
+  `app.dependency_overrides[get_settings]`/`[get_llm_gateway]` are being
+  cleared between tests via the `client` fixture.
+- **`mypy` failures in `app/workflows/executor.py` around `owner_id` or
+  `agent_run`**: `owner_id` follows the same nullable-FK narrowing
+  pattern as P6's `executor.py` (see that part's note above); `agent_run`
+  is narrowed via an explicit `assert agent_run is not None` right after
+  the per-step `try`/`except`, since the `except` clause always
+  re-raises - if a future edit removes either narrowing, expect a mypy
+  failure there, not a bug in `app.runtime`.
+
+## Acceptance (P7)
+
+**Unverified pending a real local run.** Once every command in Part G
+above has been run against a real PostgreSQL instance and produced the
+expected output, update this section (and the README's Roadmap/status
+blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
+hash, the same way every prior part was updated after its first real
+run. Per CTO instruction: Sprint P8 does not start until both this and
+Part F's Sprint P6 acceptance are explicitly approved.
