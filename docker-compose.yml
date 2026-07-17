@@ -49,6 +49,44 @@ services:
       # inside the container, which is exactly where this volume is mounted.
       - packverse_storage:/app/data/storage
 
+  worker:
+    # Sprint P8: same image as `backend` (identical build context/
+    # Dockerfile - the worker is pure Python, no separate dependencies),
+    # just a different process/command. Overrides the image's default
+    # HEALTHCHECK (which curls the API's own /health on :8000 - this
+    # container runs no HTTP server at all) with app/worker/healthcheck.py,
+    # a small script that checks this specific worker_id's own freshness
+    # in the worker_heartbeats table - see that module's docstring.
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      # Stable, predictable worker_id instead of the container-hostname
+      # default (see app/worker/runner.py's default_worker_id) - makes
+      # `docker compose logs worker` / healthcheck output identifiable
+      # across restarts without needing to look up the container id.
+      WORKER_ID: packverse-worker-1
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/alembic:/app/alembic
+      - ./backend/tests:/app/tests
+      - ./.env:/app/.env
+      - packverse_storage:/app/data/storage
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
 volumes:
   packverse_pgdata:
   packverse_storage:

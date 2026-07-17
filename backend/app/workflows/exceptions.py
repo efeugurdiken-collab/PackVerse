@@ -97,3 +97,19 @@ class WorkflowInputResolutionError(WorkflowDomainError):
         super().__init__(f"Workflow step {step_id!r}: cannot resolve input - {detail}")
         self.step_id = step_id
         self.detail = detail
+
+
+class WorkflowRunCancelledDuringExecutionError(WorkflowDomainError):
+    """Raised by app/workflows/executor.py's execute_workflow_run
+    (Sprint P8) when its optional cancellation_check callback reports a
+    cancellation request between steps. The run itself is already
+    persisted CANCELLED (with its remaining PENDING steps marked
+    CANCELLED, not SKIPPED - see WorkflowStepRunStatus's docstring for
+    why those two are kept distinct) by the time this is raised;
+    app/worker/dispatch.py catches this specifically (rather than the
+    generic WorkflowDomainError) so it can mark the owning Job CANCELLED
+    instead of FAILED."""
+
+    def __init__(self, run_id: object) -> None:
+        super().__init__(f"Workflow run {run_id} was cancelled during execution")
+        self.run_id = run_id

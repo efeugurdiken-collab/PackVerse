@@ -50,16 +50,26 @@ async def get_active_agent(db: AsyncSession, agent_id: uuid.UUID) -> AgentDefini
 
 
 async def create_run(
-    db: AsyncSession, *, agent_id: uuid.UUID, created_by_user_id: uuid.UUID
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    created_by_user_id: uuid.UUID,
+    commit: bool = True,
 ) -> AgentRun:
     """Validates the agent exists and is active, then persists a QUEUED
     run row. Does not execute it - see app/runtime/executor.py's
-    execute_run. Split out so the QUEUED state is independently
-    observable/testable (e.g. cancelling a run that hasn't started yet)
-    even though app/api/v1/runs.py's POST /runs calls create_run and
-    execute_run back to back in the same request - there is no
-    background job queue in this sprint, see the API module's docstring
-    for the full reasoning."""
+    execute_run.
+
+    `commit` defaults to True, preserving this function's original P6
+    behavior for every existing caller/test. Sprint P8's
+    app/jobs/service.py's enqueue_agent_run passes commit=False so it can
+    add a Job row and commit both in one transaction - the "avoid unsafe
+    dual writes" enqueue-safety requirement - without this function
+    needing to know anything about jobs. When commit=False, the row is
+    only flushed (not committed): it has a real id and is queryable
+    within the same transaction, but server-generated defaults like
+    created_at may not be populated on the Python object until the
+    caller's own commit+refresh."""
     await get_active_agent(db, agent_id)
     run = AgentRun(
         id=uuid.uuid4(),
@@ -68,8 +78,11 @@ async def create_run(
         status=AgentRunStatus.QUEUED,
     )
     db.add(run)
-    await db.commit()
-    await db.refresh(run)
+    if commit:
+        await db.commit()
+        await db.refresh(run)
+    else:
+        await db.flush()
     return run
 
 

@@ -57,7 +57,11 @@ async def get_active_workflow(db: AsyncSession, workflow_id: uuid.UUID) -> Workf
 
 
 async def create_workflow_run(
-    db: AsyncSession, *, workflow_id: uuid.UUID, created_by_user_id: uuid.UUID
+    db: AsyncSession,
+    *,
+    workflow_id: uuid.UUID,
+    created_by_user_id: uuid.UUID,
+    commit: bool = True,
 ) -> WorkflowRun:
     """Validates the workflow exists, is active, and has a structurally
     valid definition_json (parse_workflow_steps - raises
@@ -69,9 +73,14 @@ async def create_workflow_run(
     transaction, so a run is never observable half-created.
 
     Does not execute the run - see app/workflows/executor.py's
-    execute_workflow_run. app/api/v1/workflow_runs.py's POST
-    /workflow-runs calls both back to back in the same request, same "no
-    background job queue in this sprint" reasoning as P6's POST /runs.
+    execute_workflow_run.
+
+    `commit` defaults to True, preserving this function's original P7
+    behavior for every existing caller/test - same "commit=False lets a
+    caller add more rows to the same transaction" addition as Sprint P8
+    made to app.runtime.service.create_run (see that function's
+    docstring for the full rationale); app/jobs/service.py's
+    enqueue_workflow_run is the only caller that passes False.
     """
     workflow = await get_active_workflow(db, workflow_id)
     steps = parse_workflow_steps(workflow_id, workflow.definition_json)
@@ -99,8 +108,11 @@ async def create_workflow_run(
             )
         )
 
-    await db.commit()
-    await db.refresh(run)
+    if commit:
+        await db.commit()
+        await db.refresh(run)
+    else:
+        await db.flush()
     return run
 
 

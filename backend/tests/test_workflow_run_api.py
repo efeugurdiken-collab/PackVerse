@@ -1,9 +1,12 @@
-"""Tests for the Workflow Run API (Sprint P7): /api/v1/workflow-runs/*.
+"""Tests for the Workflow Run API (Sprint P7; Sprint P8 async execution):
+/api/v1/workflow-runs/*.
 
-Every test routes through the network-free "fake" LLM provider - the
-app's FastAPI dependency overrides (get_settings, get_llm_gateway) are
-replaced with an isolated Settings instance and a gateway wrapping only
-FakeProvider, exactly mirroring tests/test_runtime_api.py's approach.
+POST now validates and enqueues a run (202 Accepted, run and all its
+step rows stay QUEUED/PENDING) rather than executing it synchronously -
+see app/api/v1/workflow_runs.py's module docstring and
+tests/test_runtime_api.py's identical note. Execution-path behavior
+(success, per-step failure, cancellation between steps, ...) is covered
+by tests/test_worker_dispatch.py instead.
 """
 from __future__ import annotations
 
@@ -12,7 +15,6 @@ import uuid
 import pytest
 
 from app.core.config import Settings, get_settings
-from app.llm.exceptions import LLMRateLimitError, LLMTimeoutError
 from app.llm.factory import get_llm_gateway
 from app.llm.gateway import LLMGateway
 from app.llm.providers.fake import FakeProvider
@@ -109,10 +111,10 @@ async def test_operator_create_run_succeeds(
 ) -> None:
     workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
     response = await client.post(BASE, json=_payload(workflow.id), headers=operator_headers)
-    assert response.status_code == 201
+    assert response.status_code == 202
     body = response.json()
-    assert body["status"] == "completed"
-    assert body["output_text"]
+    assert body["status"] == "queued"
+    assert body["output_text"] is None
 
 
 async def test_admin_create_run_succeeds(
@@ -124,7 +126,7 @@ async def test_admin_create_run_succeeds(
 ) -> None:
     workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
     response = await client.post(BASE, json=_payload(workflow.id), headers=admin_headers)
-    assert response.status_code == 201
+    assert response.status_code == 202
 
 
 async def test_create_run_rejects_empty_user_input(
@@ -196,28 +198,9 @@ async def test_create_run_with_inactive_agent_returns_409(
     assert response.status_code == 409
 
 
-async def test_create_run_maps_rate_limit_to_429(
-    client, operator_headers, make_agent_definition, make_workflow_definition
-) -> None:
-    workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
-    settings = _workflow_settings()
-    _override(settings, FakeProvider(fail_with=LLMRateLimitError("fake")))
-
-    response = await client.post(BASE, json=_payload(workflow.id), headers=operator_headers)
-
-    assert response.status_code == 429
-
-
-async def test_create_run_maps_timeout_to_504(
-    client, operator_headers, make_agent_definition, make_workflow_definition
-) -> None:
-    workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
-    settings = _workflow_settings()
-    _override(settings, FakeProvider(fail_with=LLMTimeoutError("fake")))
-
-    response = await client.post(BASE, json=_payload(workflow.id), headers=operator_headers)
-
-    assert response.status_code == 504
+# Sprint P8 note: rate-limit/timeout step failures used to be observable
+# synchronously in POST's own response (Sprint P7). They no longer are -
+# see tests/test_worker_dispatch.py for that coverage now.
 
 
 # --- Retrieval -------------------------------------------------------------
@@ -360,8 +343,11 @@ async def test_owner_can_list_steps_of_own_run(
     assert response.status_code == 200
     steps = response.json()
     assert len(steps) == 1
-    assert steps[0]["status"] == "completed"
-    assert steps[0]["output_text"]
+    # Sprint P8: steps are created PENDING at enqueue time and stay that
+    # way until a worker actually executes them - see
+    # tests/test_worker_dispatch.py for post-execution step assertions.
+    assert steps[0]["status"] == "pending"
+    assert steps[0]["output_text"] is None
 
 
 async def test_list_steps_for_unknown_run_returns_404(
@@ -408,7 +394,7 @@ async def test_cancel_unknown_run_returns_404(
     assert response.status_code == 404
 
 
-async def test_cancel_already_completed_run_returns_409(
+async def test_cancel_queued_run_succeeds(
     client,
     workflow_gateway_override,
     operator_headers,
@@ -418,11 +404,37 @@ async def test_cancel_already_completed_run_returns_409(
     workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
     created = await client.post(BASE, json=_payload(workflow.id), headers=operator_headers)
     run_id = created.json()["id"]
-    assert created.json()["status"] == "completed"
+    assert created.json()["status"] == "queued"
 
     response = await client.post(f"{BASE}/{run_id}/cancel", headers=operator_headers)
 
-    assert response.status_code == 409
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+
+async def test_cancel_already_cancelled_run_is_idempotent(
+    client,
+    workflow_gateway_override,
+    operator_headers,
+    make_agent_definition,
+    make_workflow_definition,
+) -> None:
+    """Unlike the Agent Run API (where re-cancelling always 409s - every
+    terminal AgentRunStatus is a dead end, no exceptions), a
+    already-CANCELLED WorkflowRun stays cancellable-again as a no-op -
+    see app/workflows/service.py's cancel_run docstring for why that
+    self-loop is handled as an early return rather than added to the
+    transition table."""
+    workflow = await _one_step_workflow(make_agent_definition, make_workflow_definition)
+    created = await client.post(BASE, json=_payload(workflow.id), headers=operator_headers)
+    run_id = created.json()["id"]
+    first = await client.post(f"{BASE}/{run_id}/cancel", headers=operator_headers)
+    assert first.status_code == 200
+
+    response = await client.post(f"{BASE}/{run_id}/cancel", headers=operator_headers)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
 
 
 async def test_non_owner_cannot_cancel_someone_elses_run(

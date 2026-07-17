@@ -30,9 +30,29 @@ class ProductType(str, Enum):
 
 
 class JobStatus(str, Enum):
-    PENDING = "pending"
+    """Lifecycle of a durable queue Job (Sprint P8: Asynchronous Job
+    Execution). Renamed from this table's original P2 placeholder values
+    (PENDING/SUCCEEDED) to QUEUED/COMPLETED, and RETRYING was added, to
+    match the sprint spec's exact required state set - see
+    app/models/job.py's module docstring for why this rename is safe
+    (native_enum=False means no Postgres-level ALTER TYPE is needed; the
+    column is a plain VARCHAR with app-level validation, and the table
+    has never been used by any real code path before this sprint).
+
+    QUEUED    -> RUNNING, CANCELLED
+    RUNNING   -> COMPLETED, FAILED, RETRYING, CANCELLED
+    RETRYING  -> RUNNING, CANCELLED  (worker re-claims it like any other
+                 queued/retrying job once next_attempt_at has passed -
+                 see app/jobs/queue.py's claim_next_job)
+    COMPLETED -> (terminal)
+    FAILED    -> (terminal)
+    CANCELLED -> (terminal)
+    """
+
+    QUEUED = "queued"
     RUNNING = "running"
-    SUCCEEDED = "succeeded"
+    RETRYING = "retrying"
+    COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 

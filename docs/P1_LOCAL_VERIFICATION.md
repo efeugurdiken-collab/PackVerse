@@ -1,21 +1,25 @@
-# Local Verification (P1-P7)
+# Local Verification (P1-P8)
 
-**Status: P1, P2, P3, P4, P5 verified locally. P6 and P7 not yet
+**Status: P1, P2, P3, P4, P5 verified locally. P6, P7, and P8 not yet
 verified.** Parts A, B, D, and E below are historical record of runs
 already completed against a real PostgreSQL instance (P4 required two
 follow-up fixes - a missing `pathlib` import and a `MissingGreenlet`/
 identity-map test bug; P5 required two more - an invalid `noqa`
 directive and two stale/inverted migration-test assertions - all four
 resolved and re-verified). Part F is the reproduction guide for Sprint
-P6; Part G is the reproduction guide for Sprint P7 - both await their
-first real local run. Per explicit CTO instruction, P7 was implemented
-immediately after P6 without waiting for P6's own verification first, so
-both are outstanding simultaneously - Part G's steps assume Part F's
-migration/upgrade steps have already been run (P7's migration chains
-directly off P6's). This document exists because the environment this
-code was written in cannot run it, and the CTO instruction for every
-sprint in this repo has been explicit: do not claim a sprint passed, and
-give exact reproducible steps instead.
+P6; Part G is the reproduction guide for Sprint P7; Part H is the
+reproduction guide for Sprint P8 - all three await their first real
+local run. Per explicit CTO instruction, P7 was implemented immediately
+after P6 without waiting for P6's own verification, and P8 was
+implemented immediately after P7 without waiting for either P6's or
+P7's, so all three are outstanding simultaneously - Part G's steps
+assume Part F's migration/upgrade steps have already been run (P7's
+migration chains directly off P6's), and Part H's steps assume both
+Parts F and G's migration/upgrade steps have already been run (P8's
+migration chains directly off P7's). This document exists because the
+environment this code was written in cannot run it, and the CTO
+instruction for every sprint in this repo has been explicit: do not
+claim a sprint passed, and give exact reproducible steps instead.
 
 ## Why verification could not run here
 
@@ -599,8 +603,10 @@ blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
 hash, the same way every prior part was updated after its first real
 run. Per explicit CTO instruction, Sprint P7 (Workflow Orchestration)
 was implemented immediately after P6 without waiting for this
-verification - see Part G below - but Sprint P8 does not start until
-both P6 and P7 are explicitly approved.
+verification - see Part G below - and Sprint P8 (Asynchronous Job
+Execution) was implemented immediately after P7, also without waiting -
+see Part H below. Do not start Sprint P9 until P6, P7, and P8 are all
+explicitly approved.
 
 ## Part G — Sprint P7 (Workflow Orchestration)
 
@@ -739,5 +745,187 @@ above has been run against a real PostgreSQL instance and produced the
 expected output, update this section (and the README's Roadmap/status
 blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
 hash, the same way every prior part was updated after its first real
-run. Per CTO instruction: Sprint P8 does not start until both this and
-Part F's Sprint P6 acceptance are explicitly approved.
+run. Per explicit CTO instruction, Sprint P8 (Asynchronous Job
+Execution) was implemented immediately after P7 without waiting for
+this verification - see Part H below. Do not start Sprint P9 until P6,
+P7, and P8 are all explicitly approved.
+
+## Part H — Sprint P8 (Asynchronous Job Execution)
+
+**Not yet verified.** Written and statically validated
+(`python -m py_compile` across `app/` and `tests/`, plus a manual
+unused-import/line-length sweep, no runtime execution) in the same
+no-Docker, no-network sandbox as every prior sprint, immediately after
+P7 per explicit CTO instruction to proceed without waiting for P7's own
+verification. Needs a real local run before it can be marked verified -
+same discipline as every prior part. Because P6 and P7 are also still
+unverified, this run should apply Parts F and G's steps first (or simply
+run `alembic upgrade head`, which chains through all three migrations)
+before proceeding below.
+
+This is the first sprint with a genuinely new moving part: a second
+long-running process (`worker`), not just new tables/endpoints in the
+existing `backend` container. Run `docker compose down` then
+`docker compose up --build -d` first, so Compose picks up the new
+`worker` service definition and both containers rebuild from the same
+updated image. No new third-party dependencies were added this sprint
+(the worker's `psycopg2` healthcheck script reuses the `psycopg2-binary`
+dependency Alembic already required since P1).
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current              # -> b7f3e9a1c5d2 (head)
+docker compose exec backend alembic downgrade -1          # drops worker_heartbeats + P8's jobs columns only
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade d4e6b9a3f1c7   # back to P7 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade a1c8f7d2b3e9   # back to P6 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade 7c19e4b8a2d6   # back to P5 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `b7f3e9a1c5d2 (head)` after the first upgrade; the `downgrade
+-1` step drops only `worker_heartbeats` and the nine columns P8 added to
+`jobs` (`target_run_id`, `error_code`, `attempt_count`, `max_attempts`,
+`next_attempt_at`, `lease_expires_at`, `heartbeat_at`, `worker_id`,
+`cancel_requested_at`) while every P2-P7 table/column (including `jobs`
+itself, and `workflow_runs`/`workflow_step_runs`) stays intact
+(spot-check with `docker compose exec db psql -U packverse -d packverse
+-c '\d jobs'` - only those nine columns should be gone, `id`/`job_type`/
+`status`/`input_json`/`output_json`/`error_message`/`started_at`/
+`completed_at` should remain); the final `downgrade base` / `upgrade
+head` pair proves the whole seven-migration chain still runs cleanly end
+to end.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_job_models.py`, `test_job_queue.py`,
+`test_job_service.py`, `test_worker_dispatch.py`, `test_worker_runner.py`,
+and `test_worker_healthcheck.py` passes, plus the P8 additions to
+`test_migrations.py` and `test_health.py`, and the rewritten
+`test_runtime_api.py`/`test_workflow_run_api.py` (now asserting `202`/
+`queued` from `POST /runs`/`POST /workflow-runs` instead of the old
+synchronous `201`/`completed`), on top of all other P1-P7 tests
+continuing to pass unmodified (regression). Roughly 218 (P1-P5 baseline)
++ ~65 P6 tests + ~102 P7 tests + ~90 new/changed P8 tests. No test in
+this sprint makes a real network call - every job/worker test routes
+through the `fake` LLM provider, same as P6/P7's own tests, and the
+worker tests use their own `worker_session_factory` fixture (real
+commits against the isolated per-test schema) rather than the shared
+rollback-based `db_session` fixture, since the worker legitimately opens
+many independent sessions over its lifetime.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` → "All checks passed!"; `mypy app` → "Success: no
+issues found in N source files" where N is larger than P7's count (new
+files: `app/jobs/{__init__,exceptions,models,queue,service}.py`,
+`app/worker/{__init__,dispatch,runner,main,__main__,healthcheck}.py`,
+`app/models/worker_heartbeat.py`).
+
+### 4. Worker + health checks
+
+```bash
+docker compose ps                                    # worker should show "healthy"
+docker compose logs worker                            # should show periodic poll/heartbeat log lines
+curl -s http://localhost:8000/api/v1/health
+```
+
+Expected: `docker compose ps` shows all three services (`db`, `backend`,
+`worker`) as healthy; `docker compose logs worker` shows startup log
+lines (recovery pass, heartbeat) and no tracebacks; `GET
+/api/v1/health` returns
+`{"status":"ok","database":"connected","queue":"connected","worker":"available"}`
+once the worker has had a few seconds to send its first heartbeat.
+
+### 5. Manual smoke test (optional but recommended, no API key needed)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# There is no AgentDefinition CRUD API - seed one directly:
+docker compose exec db psql -U packverse -d packverse -c \
+  "INSERT INTO agent_definitions (id, name, role, version, status, configuration_json, created_at, updated_at) VALUES (gen_random_uuid(), 'smoke-test-agent-p8', 'Tester', 'v1.0', 'active', '{\"system_prompt\": \"You are helpful.\", \"model\": \"fake-v1\"}', now(), now()) RETURNING id;"
+# copy the returned id into AGENT_ID below
+
+curl -s -X POST http://localhost:8000/api/v1/runs \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent_id":"'"$AGENT_ID"'","user_input":"hello"}'
+# -> 202 Accepted, {"status":"queued", ...} - note: 202, not 201, and queued not completed
+
+RUN_ID=...   # from the response above
+sleep 2      # give the worker a moment to claim and execute it
+curl -s http://localhost:8000/api/v1/runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
+```
+
+Expected: the `POST /runs` call returns `202` with `"status":"queued"`
+and `"output_text":null`; a few seconds later, `GET /runs/{id}` shows
+`"status":"completed"` and a non-null `output_text` (the fake provider's
+deterministic echo) - proving the worker actually claimed and executed
+the job, without the API request itself ever calling the LLM Gateway.
+
+### If it fails
+
+- **`docker compose ps` shows `worker` as `unhealthy` or restarting**:
+  check `docker compose logs worker` first - a missing/incorrect
+  `DATABASE_URL`-equivalent env var (same `POSTGRES_*` vars `backend`
+  uses) is the most likely cause, since the worker builds its own engine
+  from the same `Settings` the API does.
+- **`GET /api/v1/health` shows `"worker":"unavailable"` even though the
+  worker container is healthy**: the container-level `HEALTHCHECK` and
+  the HTTP-level `/health` field use the same staleness threshold
+  (`worker_heartbeat_stale_after_seconds`) but are two separate checks -
+  give it a few more seconds after `docker compose up`, or check
+  `docker compose logs worker` for whether it's actually reaching its
+  heartbeat-upsert code (an early crash before the first heartbeat would
+  explain this).
+- **A queued run never leaves `queued`**: check `docker compose logs
+  worker` for claim log lines - if the worker isn't polling at all,
+  confirm the `worker` service's `command` override
+  (`python -m app.worker`) actually took effect (`docker compose exec
+  worker ps aux` should show that process, not `uvicorn`).
+- **`alembic downgrade -1` from head errors dropping a column**: the
+  nine P8 columns must be dropped in the exact reverse order the
+  migration's `downgrade()` lists them (see
+  `b7f3e9a1c5d2_add_job_queue_fields_and_worker_heartbeats.py`) - this
+  should already be correct as committed, but double-check if a manual
+  edit ever touches that file.
+- **`test_worker_runner.py` timing-sensitive tests are flaky**: the
+  lease-renewal and stale-job-recovery tests use short real `asyncio.sleep`
+  windows (order of 100-200ms) tuned for a healthy local Postgres
+  connection - a very slow/loaded CI runner could need those intervals
+  widened; this is a test-tuning issue, not a correctness bug in
+  `app/worker/runner.py` itself.
+- **`mypy` failures in `app/jobs/exceptions.py` around the `JobStatus`
+  forward reference**: this mirrors `app/runtime/exceptions.py`'s and
+  `app/workflows/exceptions.py`'s existing `TYPE_CHECKING`-only import
+  pattern exactly (avoids a runtime circular import between
+  `app.jobs.exceptions` and `app.models.enums`) - if mypy complains here,
+  the same fix already applied to those two files' `InvalidRunTransitionError`
+  /`InvalidWorkflowRunTransitionError` applies here too.
+
+## Acceptance (P8)
+
+**Unverified pending a real local run.** Once every command in Part H
+above has been run against a real PostgreSQL instance and produced the
+expected output, update this section (and the README's Roadmap/status
+blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
+hash, the same way every prior part was updated after its first real
+run. Per explicit CTO instruction: do not start Sprint P9 until P6, P7,
+and P8 are all explicitly approved.

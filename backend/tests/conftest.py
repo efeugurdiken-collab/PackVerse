@@ -35,12 +35,14 @@ from app.models import Base
 from app.models.agent_definition import AgentDefinition
 from app.models.enums import (
     AgentStatus,
+    JobStatus,
     ProductStatus,
     ProductType,
     UserRole,
     UserStatus,
     WorkflowStatus,
 )
+from app.models.job import Job
 from app.models.product import Product
 from app.models.user import User
 from app.models.workflow_definition import WorkflowDefinition
@@ -72,6 +74,28 @@ async def test_engine() -> AsyncGenerator[AsyncEngine, None]:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
         await engine.dispose()
+
+
+@pytest.fixture
+def worker_session_factory(
+    test_engine: AsyncEngine,
+) -> Callable[[], AsyncSession]:
+    """A real async_sessionmaker bound directly to the per-test engine -
+    NOT the single already-instantiated db_session below. Sprint P8's
+    worker runner (app/worker/runner.py) legitimately opens many
+    independent, sequential sessions over its lifetime (one per claim,
+    one per heartbeat tick, ...) via a `session_factory()` callable;
+    db_session is a single Session instance whose `async with` context
+    manager closes it on exit, so passing `lambda: db_session` as that
+    callable would break the second time anything tried to use it.
+    test_engine already creates and drops a fully isolated schema per
+    test (see that fixture), so sessions from this factory committing
+    "for real" is safe - there is no shared outer transaction to protect
+    here, unlike db_session's rollback-based isolation. Tests that use
+    this fixture must set up their own data through it too (not through
+    db_session or the make_* fixtures below, which run on a separate,
+    uncommitted connection those sessions cannot see)."""
+    return async_sessionmaker(bind=test_engine, expire_on_commit=False, autoflush=False)
 
 
 @pytest.fixture
@@ -279,6 +303,48 @@ def make_workflow_definition(
         return workflow
 
     return _make_workflow_definition
+
+
+@pytest.fixture
+def make_job(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[Job]]:
+    """Factory fixture: `await make_job(job_type="agent_run",
+    target_run_id=run.id)` inserts a Job directly via the ORM and
+    returns it - Sprint P8's queue/worker tests need to construct jobs in
+    states (RUNNING with a specific lease_expires_at, RETRYING with a
+    specific attempt_count, etc.) that app.jobs.service.enqueue_* never
+    produces on its own, the same "bypass the service layer to set up a
+    specific state" reasoning as make_user's `status=UserStatus.DISABLED`
+    case."""
+
+    async def _make_job(
+        *,
+        job_type: str = "agent_run",
+        status: JobStatus = JobStatus.QUEUED,
+        target_run_id: uuid.UUID | None = None,
+        input_json: dict[str, object] | None = None,
+        attempt_count: int = 0,
+        max_attempts: int = 3,
+        **overrides: object,
+    ) -> Job:
+        job = Job(
+            job_type=job_type,
+            status=status,
+            target_run_id=target_run_id,
+            input_json=(
+                input_json if input_json is not None else {"user_input": "hi", "context": None}
+            ),
+            attempt_count=attempt_count,
+            max_attempts=max_attempts,
+            **overrides,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return job
+
+    return _make_job
 
 
 @pytest.fixture

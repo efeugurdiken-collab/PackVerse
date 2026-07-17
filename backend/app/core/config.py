@@ -133,6 +133,38 @@ class Settings(BaseSettings):
     openai_organization: str | None = None
     openai_project: str | None = None
 
+    # --- Job Queue / Worker (Sprint P8) ---
+    # Default bounded-retry ceiling for a newly-enqueued job - a per-job
+    # override is possible (Job.max_attempts) but nothing in this sprint
+    # sets one, so every job currently gets this value. Only worker/infra
+    # -level failures are ever retried - see app/worker/dispatch.py's
+    # module docstring for the full retry-policy rationale.
+    job_max_attempts: int = 3
+    # How long a worker's claim on a job is valid before it's considered
+    # abandoned and eligible for stale-lease recovery. Must comfortably
+    # exceed job_heartbeat_interval_seconds - a live worker renews the
+    # lease well before it can expire; only a genuinely stuck/crashed
+    # worker ever lets it lapse.
+    job_lease_seconds: float = 120.0
+    # How often a worker renews its lease on the job it's currently
+    # executing (a heartbeat) - independent of job_worker_poll_interval_
+    # seconds, which only governs how often an IDLE worker checks for new
+    # work.
+    job_heartbeat_interval_seconds: float = 15.0
+    job_worker_poll_interval_seconds: float = 1.0
+    # Exponential backoff base for job-level retries: attempt N waits
+    # job_retry_backoff_base_seconds * 2^(N-1) before becoming eligible
+    # again - mirrors app/llm/gateway.py's own retry backoff shape
+    # (Sprint P5), applied one layer up (whole-job re-attempts, not
+    # individual provider calls, which the LLM Gateway already retries on
+    # its own).
+    job_retry_backoff_base_seconds: float = 5.0
+    # A worker_heartbeats row older than this is considered dead for
+    # /api/v1/health's "worker available" reporting - should comfortably
+    # exceed job_heartbeat_interval_seconds for the same reason as
+    # job_lease_seconds above.
+    worker_heartbeat_stale_after_seconds: float = 60.0
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:

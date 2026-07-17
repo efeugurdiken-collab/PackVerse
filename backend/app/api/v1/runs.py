@@ -1,22 +1,26 @@
-"""Agent Run API endpoints (Sprint P6: AI Runtime).
+"""Agent Run API endpoints (Sprint P6: AI Runtime; Sprint P8: async
+execution).
 
-POST /runs creates AND executes a run synchronously, in one request -
-there is no background job queue anywhere in this codebase yet, so the
-full Queued -> Running -> Completed/Failed flow happens before the
-response is returned (see README Known Limitations). A run that fails
-at the LLM Gateway step (or due to a misconfigured/inactive agent
-discovered at execution time) is still persisted - status FAILED,
-error_code/error_message set - but the request itself returns the same
-HTTP error app/api/v1/llm.py would return for the equivalent
-POST /llm/generate failure, per the sprint's "Return existing API error
-format". _map_llm_error is imported directly from app.api.v1.llm rather
-than reimplemented here, so there is exactly one LLMError -> HTTP status
-mapping table in the whole codebase.
+POST /runs validates and enqueues a run, then returns 202 Accepted with
+the run in its QUEUED state - it no longer executes anything itself. A
+separate worker process (app/worker/) claims the paired Job from the
+durable queue (app/jobs/) and calls the exact same
+app.runtime.executor.execute_run this endpoint used to call directly;
+see app/jobs/service.py's enqueue_agent_run for how the run row and its
+Job are persisted atomically. get/list/cancel below keep their original
+response shapes and status codes - only POST's status code and the
+run's returned status changed (previously always terminal by the time
+the response was sent; now always QUEUED). _map_llm_error is still
+imported here only because app/api/v1/workflow_runs.py's own error
+mapping re-exports it via this module's _map_runtime_error pattern; this
+file itself no longer raises LLMError-derived HTTP errors (POST returns
+before any LLM call happens).
 
-Authorization: creating/executing/cancelling a run requires operator or
-admin (same bar as POST /llm/generate, since executing an agent costs
-real provider tokens); any active role can read, scoped to their own
-runs unless admin. Matches app/api/v1/llm.py's matrix exactly.
+Authorization: creating/cancelling a run requires operator or admin
+(same bar as POST /llm/generate, since executing an agent costs real
+provider tokens once the worker picks it up); any active role can read,
+scoped to their own runs unless admin. Matches app/api/v1/llm.py's
+matrix exactly.
 """
 from __future__ import annotations
 
@@ -26,12 +30,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_roles
-from app.api.v1.llm import _map_llm_error
 from app.core.config import Settings, get_settings
 from app.database.session import get_db
-from app.llm.exceptions import LLMError
-from app.llm.factory import get_llm_gateway
-from app.llm.gateway import LLMGateway
+from app.jobs import service as job_service
+from app.jobs.exceptions import JobAlreadyRunningError
 from app.models.enums import UserRole
 from app.models.user import User
 from app.runtime import service as runtime_service
@@ -42,7 +44,6 @@ from app.runtime.exceptions import (
     InvalidRunTransitionError,
     RuntimeDomainError,
 )
-from app.runtime.executor import execute_run
 from app.schemas.common import Page
 from app.schemas.runtime import AgentRunCreate, AgentRunRead
 
@@ -64,32 +65,22 @@ def _map_runtime_error(exc: RuntimeDomainError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
 
 
-@router.post("", response_model=AgentRunRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AgentRunRead, status_code=status.HTTP_202_ACCEPTED)
 async def create_and_execute_run(
     payload: AgentRunCreate,
     db: AsyncSession = Depends(get_db),
-    gateway: LLMGateway = Depends(get_llm_gateway),
     settings: Settings = Depends(get_settings),
     current_user: User = Depends(_can_execute),
 ) -> AgentRunRead:
     try:
-        run = await runtime_service.create_run(
-            db, agent_id=payload.agent_id, created_by_user_id=current_user.id
-        )
-    except RuntimeDomainError as exc:
-        raise _map_runtime_error(exc) from exc
-
-    try:
-        run = await execute_run(
+        run, _job = await job_service.enqueue_agent_run(
             db,
-            gateway,
-            settings,
-            run=run,
+            agent_id=payload.agent_id,
+            created_by_user_id=current_user.id,
             user_input=payload.user_input,
             context=payload.context,
+            max_attempts=settings.job_max_attempts,
         )
-    except LLMError as exc:
-        raise _map_llm_error(exc) from exc
     except RuntimeDomainError as exc:
         raise _map_runtime_error(exc) from exc
 
@@ -133,8 +124,16 @@ async def cancel_run(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(_can_execute),
 ) -> AgentRunRead:
+    """Sprint P8: delegates to app.jobs.service.cancel_agent_run, which
+    cancels a still-QUEUED/RETRYING job+run pair, or raises
+    JobAlreadyRunningError (409) if a worker has already claimed the job
+    - an in-flight agent-run job cannot be interrupted mid-request. See
+    that module's docstring for the full three-tier cancellation
+    design."""
     try:
-        run = await runtime_service.cancel_run(db, run_id, current_user)
+        run = await job_service.cancel_agent_run(db, run_id, current_user)
+    except JobAlreadyRunningError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except RuntimeDomainError as exc:
         raise _map_runtime_error(exc) from exc
     return AgentRunRead.model_validate(run)

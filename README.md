@@ -77,6 +77,30 @@ failed one runs. Still no parallel execution, DAG branching, human
 approval steps, whole-workflow retries, cron/scheduled workflows,
 distributed queues, MCP, RAG, or streaming.
 
+**Sprint P8 scope:** Asynchronous Job Execution - `POST /api/v1/runs` and
+`POST /api/v1/workflow-runs` now validate and *enqueue* a run instead of
+executing it synchronously, returning `202 Accepted` immediately with the
+run in its `queued` state. A separate `worker` process (`app/worker/`,
+started via `docker compose`'s new `worker` service or `python -m
+app.worker`) polls a durable, PostgreSQL-table-backed job queue
+(`app/jobs/` - the pre-existing but previously-unused `jobs` table,
+extended with attempt/lease/heartbeat/worker columns; see "Job Queue &
+Worker" below for the full queue-technology rationale) and executes jobs
+by calling the exact same, unmodified P6 (`execute_run`) and P7
+(`execute_workflow_run`) executors this sprint's API endpoints used to
+call directly. A `Job` lifecycle (`queued -> running ->
+completed/failed/retrying/cancelled`) tracks attempts, leases,
+heartbeats, and errors; failures are retried with exponential backoff
+only when they're genuinely transient infrastructure problems (never for
+invalid definitions, inactive agents, malformed input, or a run that's
+already terminal); stale jobs from a crashed worker are recovered via
+lease-timeout on startup and periodically; cancellation is immediate for
+queued work and cooperative (checked between workflow steps) for
+in-flight work; and `/api/v1/health` now reports queue connectivity and
+worker availability alongside database connectivity. Still no scheduled/
+cron jobs, parallel workflow steps, DAG branching, WebSocket/streaming
+progress, human-approval steps, or a Kubernetes-style orchestrator.
+
 > P1-P6 were all written in a sandboxed environment with no Docker and
 > no external network access, then verified locally by the maintainer.
 > P1/P2: pytest (20 passed), ruff, mypy all passed. P3: 58 passed, mypy
@@ -88,14 +112,14 @@ distributed queues, MCP, RAG, or streaming.
 > pre-existing warnings), ruff clean, mypy clean across 64 source files -
 > after two follow-up fixes caught by real local runs (an invalid `noqa`
 > directive, and two stale/inverted assertions in migration tests left
-> over from adding the P5 `llm_requests` table). P6 was written and
-> statically validated (`python -m py_compile`, not executed) the same
-> way, in an environment with no Docker and no network access, and has
-> not yet received a real local verification pass. P7 was written and
-> statically validated the same way, immediately after P6, per explicit
-> CTO instruction to proceed without waiting for P6's local verification -
-> both sprints' real local `./verify.sh` results are outstanding
-> simultaneously. See
+> over from adding the P5 `llm_requests` table). P6, P7, and P8 were all
+> written and statically validated (`python -m py_compile` plus a manual
+> unused-import/line-length sweep, not executed) the same way, in an
+> environment with no Docker and no network access - P7 immediately
+> after P6, and P8 immediately after P7, per explicit CTO instruction to
+> proceed without waiting for the prior sprint's local verification. All
+> three sprints' real local `./verify.sh` results are outstanding
+> simultaneously as of P8. See
 > [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md) for
 > the full history and exact reproduction steps.
 
@@ -132,8 +156,15 @@ packverse-platform/
 │   │   ├── workflows/       # Workflow Orchestration: exceptions.py, models.py (state machines),
 │   │   │                      #   definition.py (steps parsing/validation), input_builder.py,
 │   │   │                      #   service.py (create/get/list/cancel/steps), executor.py (execute_workflow_run)
+│   │   ├── jobs/             # Durable job queue (Sprint P8): exceptions.py, models.py (state machine),
+│   │   │                      #   queue.py (claim/heartbeat/complete/fail/retry/cancel/recover - low level),
+│   │   │                      #   service.py (enqueue_agent_run/enqueue_workflow_run/cancel_* - API-facing)
+│   │   ├── worker/           # Standalone worker process (Sprint P8): dispatch.py (Job -> P6/P7 executor),
+│   │   │                      #   runner.py (poll loop + lease renewal + heartbeat), main.py/__main__.py
+│   │   │                      #   (`python -m app.worker` entrypoint), healthcheck.py (Docker HEALTHCHECK)
 │   │   └── main.py         # FastAPI app entrypoint
-│   ├── tests/                # model, API, auth, authorization, storage, asset, LLM gateway, AI runtime, workflow orchestration, migration, and health tests
+│   ├── tests/                # model, API, auth, authorization, storage, asset, LLM gateway, AI runtime,
+│   │                          #   workflow orchestration, job queue, worker, migration, and health tests
 │   ├── alembic/
 │   │   └── versions/
 │   │       ├── 06b17a0f30ad_create_domain_tables.py   # P2 schema baseline
@@ -141,10 +172,11 @@ packverse-platform/
 │   │       ├── ae14cc314d2f_extend_assets_for_storage.py  # P4: storage columns on assets
 │   │       ├── 7c19e4b8a2d6_create_llm_requests_table.py  # P5: llm_requests table
 │   │       ├── a1c8f7d2b3e9_create_agent_runs_table.py    # P6: agent_runs table
-│   │       └── d4e6b9a3f1c7_create_workflow_run_tables.py # P7: workflow_runs, workflow_step_runs tables
+│   │       ├── d4e6b9a3f1c7_create_workflow_run_tables.py # P7: workflow_runs, workflow_step_runs tables
+│   │       └── b7f3e9a1c5d2_add_job_queue_fields_and_worker_heartbeats.py # P8: jobs queue columns + worker_heartbeats
 │   ├── Dockerfile
 │   └── pyproject.toml
-├── docker-compose.yml
+├── docker-compose.yml       # db, backend, worker (Sprint P8) services
 ├── .env.example
 ├── .gitignore
 ├── docs/
@@ -202,18 +234,31 @@ definitions are inserted directly (seeded from the vault's
 docker compose up --build
 ```
 
-This starts PostgreSQL and the FastAPI backend. The backend waits for the
-database's healthcheck to pass before starting.
+This starts PostgreSQL, the FastAPI backend, and (Sprint P8) the
+background `worker` process - all three wait for the database's
+healthcheck to pass before starting; the worker uses the same image as
+`backend`, just a different command (`python -m app.worker`) and its own
+Docker `HEALTHCHECK` (`app/worker/healthcheck.py`, checking its own
+`worker_heartbeats` freshness). Run migrations (see Database Migrations
+below) before either `backend` or `worker` can do anything useful - the
+worker will simply find an empty queue until then.
 
 ### 3. Verify
 
 ```bash
 curl http://localhost:8000/
 curl http://localhost:8000/api/v1/health
+docker compose logs worker
 ```
 
-`/api/v1/health` returns `{"status": "ok", "database": "connected"}` once
-both services are healthy.
+`/api/v1/health` returns
+`{"status": "ok", "database": "connected", "queue": "connected",
+"worker": "available"}` once all three services are healthy and the
+worker has sent at least one heartbeat (`queue` mirrors `database` by
+design - the job queue lives in the same PostgreSQL instance, see "Job
+Queue & Worker" below; `worker` only flips to `available` once
+`worker_heartbeats` has a fresh row, which can take a few seconds after
+first boot).
 
 Interactive API docs: http://localhost:8000/docs
 
@@ -236,19 +281,24 @@ app itself connects to. This applies to the running app; the test suite
 overrides it to point at `settings.test_sync_database_url` instead (see
 Tests below).
 
-All six migrations (`06b17a0f30ad_create_domain_tables.py` for P2,
+All seven migrations (`06b17a0f30ad_create_domain_tables.py` for P2,
 `1f20f57819a3_create_users_table.py` for P3,
 `ae14cc314d2f_extend_assets_for_storage.py` for P4,
 `7c19e4b8a2d6_create_llm_requests_table.py` for P5,
 `a1c8f7d2b3e9_create_agent_runs_table.py` for P6,
-`d4e6b9a3f1c7_create_workflow_run_tables.py` for P7) were written by hand
-rather than autogenerated - the sandbox this repo was built in has no
-PostgreSQL instance to diff against. Verify the full chain locally:
+`d4e6b9a3f1c7_create_workflow_run_tables.py` for P7,
+`b7f3e9a1c5d2_add_job_queue_fields_and_worker_heartbeats.py` for P8) were
+written by hand rather than autogenerated - the sandbox this repo was
+built in has no PostgreSQL instance to diff against. P8's migration only
+adds columns to the pre-existing (P2-era, previously unused) `jobs`
+table and creates the new `worker_heartbeats` table - it does not touch
+or drop any prior table. Verify the full chain locally:
 
 ```bash
 docker compose exec backend alembic upgrade head
-docker compose exec backend alembic current          # -> d4e6b9a3f1c7 (head)
-docker compose exec backend alembic downgrade -1      # drops workflow_runs + workflow_step_runs only
+docker compose exec backend alembic current          # -> b7f3e9a1c5d2 (head)
+docker compose exec backend alembic downgrade -1      # drops worker_heartbeats + P8's jobs columns only
+docker compose exec backend alembic downgrade d4e6b9a3f1c7   # back to P7 head
 docker compose exec backend alembic downgrade a1c8f7d2b3e9   # back to P6 head
 docker compose exec backend alembic downgrade 7c19e4b8a2d6   # back to P5 head
 docker compose exec backend alembic downgrade ae14cc314d2f   # back to P4 head
@@ -365,18 +415,18 @@ as `LLM_PRICING_JSON`; an unpriced provider/model pair returns
 generated content is ever persisted - `llm_requests` stores routing,
 token counts, cost, latency, and status only.
 
-## Agent Run API (Sprint P6: AI Runtime)
+## Agent Run API (Sprint P6: AI Runtime; Sprint P8: async execution)
 
-Every endpoint requires a valid access token. Creating/executing and
-cancelling a run require `operator` or `admin`; reads accept any active
-role, scoped to the caller's own runs unless `admin`.
+Every endpoint requires a valid access token. Creating/cancelling a run
+require `operator` or `admin`; reads accept any active role, scoped to
+the caller's own runs unless `admin`.
 
 | Method | Path                          | Role required    | Description |
 |--------|--------------------------------|-------------------|-------------|
-| POST   | `/api/v1/runs`                | operator, admin   | Create **and execute** a run against an `AgentDefinition` in one request (`agent_id`, `user_input`, optional `context`). Returns the finished run - `status` is `completed` or `failed`. 404 unknown agent, 409 agent not `active`, 422 misconfigured agent or validation error, 429/502/504/etc. for the same LLM Gateway failures `POST /llm/generate` maps (`app.api.v1.llm._map_llm_error`, reused directly). |
+| POST   | `/api/v1/runs`                | operator, admin   | Validate and **enqueue** a run against an `AgentDefinition` (`agent_id`, `user_input`, optional `context`). Returns `202 Accepted` with the run in its `queued` state - it does not execute here (Sprint P8; see Job Queue & Worker below). 404 unknown agent, 409 agent not `active`. |
 | GET    | `/api/v1/runs/{id}`           | any active role   | Fetch one run's metadata (status/timestamps/duration/provider/model/tokens/cost/output/error) - never `user_input`/`context`. 404 for unknown or non-owned ids. |
 | GET    | `/api/v1/runs`                | any active role   | Paginated list (`limit`, `offset`), scoped to the caller unless admin. |
-| POST   | `/api/v1/runs/{id}/cancel`    | operator, admin   | Cancel a run. Valid from `queued` or `running`; 409 if already `completed`/`failed`/`cancelled`. |
+| POST   | `/api/v1/runs/{id}/cancel`    | operator, admin   | Cancel a run. `queued`/`retrying` job: cancelled immediately (`200`). A worker has already claimed the job (`running`): `409` - an in-flight provider call cannot be interrupted. Already `completed`/`failed`/`cancelled`: `409`. |
 
 Example, using an `AgentDefinition` seeded directly (there is no
 `AgentDefinition` CRUD API - see Setup above) with
@@ -386,6 +436,8 @@ Example, using an `AgentDefinition` seeded directly (there is no
 curl -X POST http://localhost:8000/api/v1/runs \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"agent_id": "'"$AGENT_ID"'", "user_input": "hello"}'
+# -> 202 Accepted, {"status": "queued", "output_text": null, ...}
+# a running `worker` process picks it up shortly after - poll GET below
 
 curl http://localhost:8000/api/v1/runs -H "Authorization: Bearer $TOKEN"
 curl http://localhost:8000/api/v1/runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
@@ -394,18 +446,16 @@ curl -X POST http://localhost:8000/api/v1/runs/$RUN_ID/cancel -H "Authorization:
 
 **Important architectural decisions:**
 
-- **No background job queue.** `POST /runs` creates the run (`queued`)
-  and executes it (`running` -> `completed`/`failed`) synchronously, in
-  the same request - there is no Celery/RQ/arq worker anywhere in this
-  codebase. The full `queued -> running -> completed/failed` flow the
-  spec describes happens before the response is returned; a client
-  never observes an in-flight run mid-execution. `RUNNING -> CANCELLED`
-  is still a real, validated transition in the state machine
-  (`app/runtime/models.py`) and is exercised directly at the service
-  layer (`tests/test_runtime_service.py`) - it just isn't reachable
-  through the synchronous HTTP flow today. A future sprint adding a real
-  task queue would wire genuine mid-flight cancellation into this same
-  state machine without changing it.
+- **Execution moved out of the request/response cycle in Sprint P8.**
+  `POST /runs` now only validates and enqueues (`app.jobs.service.
+  enqueue_agent_run`, in the same transaction as the paired `Job` row -
+  see Job Queue & Worker below); a separate `worker` process calls the
+  exact same, unmodified `app.runtime.executor.execute_run` this
+  endpoint used to call directly. `RUNNING -> CANCELLED` is a real,
+  validated transition in the state machine (`app/runtime/models.py`),
+  now reachable in practice too, just not for a job a worker has already
+  claimed (see the cancel row above and the documented limitation in Job
+  Queue & Worker).
 - **`agent_runs` persists `output_text`; unlike `llm_requests` (P5), it
   does not persist `user_input`/`context`.** P5 deliberately excludes
   all prompt/response content. P6's own persistence requirements
@@ -414,12 +464,16 @@ curl -X POST http://localhost:8000/api/v1/runs/$RUN_ID/cancel -H "Authorization:
   the raw input that produced it is not (staying consistent with P5's
   security posture where the spec doesn't say otherwise). See
   `app/models/agent_run.py`'s module docstring.
-- **Gateway/configuration failures become HTTP errors, not silent
-  `status: failed` 201s.** The run row is still persisted as `failed`
-  either way (with `error_code`/`error_message`) - `GET /runs` will show
-  it - but the `POST /runs` response itself reuses the exact same
-  LLMError-to-HTTP-status mapping `POST /llm/generate` uses, per the
-  sprint's "Return existing API error format".
+- **Gateway/configuration failures are no longer visible in `POST
+  /runs`'s own response (Sprint P8 change).** The run row is still
+  persisted as `failed` either way (with `error_code`/`error_message`) -
+  `GET /runs` will show it - but since execution now happens later, in
+  the worker process, `POST /runs` itself can only ever return `202`, a
+  `4xx` for an enqueue-time validation problem (unknown/inactive agent),
+  or a genuine `5xx` if enqueueing itself fails. The LLMError-to-HTTP
+  mapping `POST /llm/generate` uses is now applied inside the worker (as
+  a job-level FAILED-not-retried outcome, not an HTTP status - there is
+  no HTTP response left to map it onto by the time it happens).
 - **No `AgentDefinition` CRUD API was added.** Definitions are still
   seeded directly (per Sprint P2's `AgentDefinitionRead` docstring); this
   sprint only adds the ability to *execute* one.
@@ -430,20 +484,20 @@ curl -X POST http://localhost:8000/api/v1/runs/$RUN_ID/cancel -H "Authorization:
   already follows this shape, and "follow current project style
   exactly" wins over the spec's "suggested" module structure.
 
-## Workflow Run API (Sprint P7: Workflow Orchestration)
+## Workflow Run API (Sprint P7: Workflow Orchestration; Sprint P8: async execution)
 
-Every endpoint requires a valid access token. Creating/executing and
-cancelling a run require `operator` or `admin`; reads accept any active
-role, scoped to the caller's own runs unless `admin` - identical matrix
-to the Agent Run API above.
+Every endpoint requires a valid access token. Creating/cancelling a run
+require `operator` or `admin`; reads accept any active role, scoped to
+the caller's own runs unless `admin` - identical matrix to the Agent Run
+API above.
 
 | Method | Path                                   | Role required    | Description |
 |--------|-------------------------------------------|-------------------|-------------|
-| POST   | `/api/v1/workflow-runs`                | operator, admin   | Create **and execute** a run against a `WorkflowDefinition` in one request (`workflow_id`, `user_input`, optional `context`). Runs every step sequentially through the P6 AI Runtime and returns the finished run - `status` is `completed` or `failed`. 404 unknown workflow or unknown referenced agent, 409 workflow not `active` or referenced agent not `active`, 422 invalid workflow definition or a step's own input-mapping problem, 429/502/504/etc. for the same LLM Gateway failures a step's execution can raise (reusing `app.api.v1.llm._map_llm_error` and `app.api.v1.runs._map_runtime_error` directly). |
+| POST   | `/api/v1/workflow-runs`                | operator, admin   | Validate and **enqueue** a run against a `WorkflowDefinition` (`workflow_id`, `user_input`, optional `context`) - persists the run plus one `pending` `WorkflowStepRun` per step. Returns `202 Accepted` with the run in its `queued` state (Sprint P8; see Job Queue & Worker below). 404 unknown workflow or unknown referenced agent, 409 workflow not `active` or referenced agent not `active`, 422 invalid workflow definition. |
 | GET    | `/api/v1/workflow-runs/{id}`           | any active role   | Fetch one run's metadata (status/timestamps/duration/output/error) - never `user_input`/`context`. 404 for unknown or non-owned ids. |
 | GET    | `/api/v1/workflow-runs`                | any active role   | Paginated list (`limit`, `offset`), scoped to the caller unless admin. |
 | GET    | `/api/v1/workflow-runs/{id}/steps`     | any active role   | List that run's `WorkflowStepRun`s in execution order - each includes `input_snapshot`, `output_text`, `status`, `agent_run_id` (linking to the underlying P6 `AgentRun`), and error fields. 404 for unknown or non-owned run ids. |
-| POST   | `/api/v1/workflow-runs/{id}/cancel`    | operator, admin   | Cancel a run. Valid from `queued` or `running`; re-cancelling an already-`cancelled` run succeeds as a no-op; 409 if already `completed`/`failed`. |
+| POST   | `/api/v1/workflow-runs/{id}/cancel`    | operator, admin   | Cancel a run. `queued`/`retrying` job: cancelled immediately (`200`), same as the Agent Run API. A worker has already claimed the job (`running`): a cooperative `cancel_requested_at` flag is set instead and the run is returned unchanged (still `200`, still `running`) - the worker checks this flag between workflow steps and stops there once it notices; a single in-flight provider call within a step still cannot be interrupted. Re-cancelling an already-`cancelled` run succeeds as a no-op; `409` if already `completed`/`failed`. |
 
 Example, using a `WorkflowDefinition` seeded directly (there is no
 `WorkflowDefinition` CRUD API - definitions are still seeded, same as
@@ -474,6 +528,7 @@ Example, using a `WorkflowDefinition` seeded directly (there is no
 curl -X POST http://localhost:8000/api/v1/workflow-runs \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"workflow_id": "'"$WORKFLOW_ID"'", "user_input": "hello"}'
+# -> 202 Accepted, {"status": "queued", "output_text": null, ...}
 
 curl http://localhost:8000/api/v1/workflow-runs -H "Authorization: Bearer $TOKEN"
 curl http://localhost:8000/api/v1/workflow-runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
@@ -481,8 +536,8 @@ curl http://localhost:8000/api/v1/workflow-runs/$RUN_ID/steps -H "Authorization:
 curl -X POST http://localhost:8000/api/v1/workflow-runs/$RUN_ID/cancel -H "Authorization: Bearer $TOKEN"
 ```
 
-Example response body for `GET /workflow-runs/{id}/steps` after the
-two-step example above completes:
+Example response body for `GET /workflow-runs/{id}/steps` once a worker
+has picked up and finished the two-step example above:
 
 ```json
 [
@@ -501,14 +556,15 @@ two-step example above completes:
 
 **Important architectural decisions:**
 
-- **No background job queue, same as P6.** `POST /workflow-runs` creates
-  the run (`queued`) and executes every step (`running` ->
-  `completed`/`failed`) synchronously, in the same request. A client
-  never observes an in-flight run mid-execution; `RUNNING -> CANCELLED`
-  is a real, validated transition exercised directly at the service
-  layer (`tests/test_workflow_service.py`'s
-  `test_cancel_running_run_only_cancels_pending_steps`), not reachable
-  through the synchronous HTTP flow today.
+- **Execution moved out of the request/response cycle in Sprint P8,
+  same as the Agent Run API.** `POST /workflow-runs` now only validates
+  and enqueues (`app.jobs.service.enqueue_workflow_run`, in the same
+  transaction as the paired `Job` row and every `pending`
+  `WorkflowStepRun`); a separate `worker` process calls the exact same,
+  unmodified `app.workflows.executor.execute_workflow_run` this endpoint
+  used to call directly - now with an extra optional
+  `cancellation_check` callback the worker supplies (see Job Queue &
+  Worker below), which Sprint P7's synchronous flow never needed.
 - **The executor never calls `app.llm` or `app.services.llm_service`
   directly.** Every step goes through `app.runtime.service.create_run` +
   `app.runtime.executor.execute_run` - the exact same P6 code path
@@ -551,10 +607,162 @@ two-step example above completes:
   for `AgentDefinition` - definitions are still seeded directly; this
   sprint only adds the ability to *execute* one.
 
-**Known limitation:** as with P6, true "cancel a workflow that is
-actively executing right now" concurrency does not exist in this
-synchronous architecture - see `app/workflows/service.py`'s `cancel_run`
-docstring for the full reasoning.
+**Known limitation:** cancelling a workflow step's own single in-flight
+LLM Gateway call is still not possible (same underlying limitation as
+the Agent Run API) - the cooperative `cancel_requested_at` flag is only
+checked *between* steps, not mid-step. See "Job Queue & Worker" below
+for the full cancellation design.
+
+## Job Queue & Worker (Sprint P8: Asynchronous Job Execution)
+
+```
+  client
+    │
+    │ POST /runs or /workflow-runs
+    ▼
+  backend (FastAPI)  ──validate + enqueue, one db.commit()──▶  jobs table (PostgreSQL)
+    │                                                                │  ▲
+    │ 202 Accepted, run status = queued                              │  │ SELECT ... FOR UPDATE
+    ▼                                                                │  │ SKIP LOCKED (poll loop)
+  client polls                                                       ▼  │
+    GET /runs/{id}                                                worker (app/worker/)
+    GET /workflow-runs/{id}/steps                                    │
+        ▲                                                            │ calls, unchanged
+        │  same AgentRun / WorkflowRun / WorkflowStepRun rows        ▼
+        └───────────────────────────────────────────────  app.runtime.executor.execute_run
+                                                             app.workflows.executor.execute_workflow_run
+```
+
+**Queue technology choice: the existing PostgreSQL database, via a
+`jobs` table claimed with `SELECT ... FOR UPDATE SKIP LOCKED`** - not
+Redis/RabbitMQ/Celery/arq, and not a hand-rolled message broker. The
+sprint explicitly calls for "the smallest production-sensible queue
+technology" and endorses "a durable database-backed job table with
+worker polling" by name; introducing a second stateful service (a
+broker) for a single-worker-process MVP would be the "over-engineering"
+the same spec warns against. `SELECT ... FOR UPDATE SKIP LOCKED` is
+natively supported by `asyncpg`/SQLAlchemy and guarantees at most one
+worker can ever hold a given job `RUNNING` at a time, even with multiple
+worker processes/replicas running concurrently.
+
+**Enqueue safety - not a naive dual write, not a transactional
+outbox.** `app.runtime.service.create_run` and
+`app.workflows.service.create_workflow_run` both gained a
+`commit: bool = True` parameter (default preserves every pre-P8
+caller/test unchanged). `app.jobs.service.enqueue_agent_run` /
+`enqueue_workflow_run` call them with `commit=False`, add the paired
+`Job` row to the same session, and issue exactly **one** `db.commit()`
+for both. A transactional outbox pattern (writing an outbox row plus a
+separate relay process) would solve a problem that doesn't exist here:
+the queue already lives in the same database as the run it enqueues, so
+one transaction is sufficient by construction - there is no cross-system
+boundary to bridge.
+
+**Job lifecycle:** `queued -> running -> completed | failed | retrying |
+cancelled`, `retrying -> running | cancelled` (see
+`app/jobs/models.py`'s `JOB_TRANSITIONS`). Persisted per job:
+`job_type` (`agent_run`/`workflow_run`), `target_run_id` (a polymorphic
+reference to `agent_runs.id`/`workflow_runs.id`, disambiguated by
+`job_type` - no FK, since it points at two different tables),
+`attempt_count`/`max_attempts`, `next_attempt_at` (backoff), `heartbeat_at`/
+`lease_expires_at`/`worker_id` (liveness), `cancel_requested_at`
+(cooperative cancel signal), `error_code`/`error_message` (safe,
+human-readable only - never a raw provider payload, stack trace, or
+credential), and `input_json` (the caller's `user_input`/`context` - see
+below). `output_json` stays unused/null; the `AgentRun`/`WorkflowRun` row
+remains the single source of truth for output.
+
+**A deliberate privacy divergence:** `Job.input_json` DOES persist the
+caller's raw `user_input`/`context` - the first place in this codebase
+that happens. P5/P6/P7 all avoid persisting raw prompts specifically
+because the same request that creates a run also executes it, so the
+input only ever needs to live in memory. Sprint P8 breaks that
+assumption: the worker that executes a job is a *different process*,
+possibly running much later, with no other way to know what to execute.
+The sprint's own privacy carve-out ("no secrets, credentials, or raw
+provider payloads") does not cover a caller's own operational request
+content, and `Job.input_json` already existed for exactly this purpose
+(see `app/models/job.py`'s docstring). **Known limitation:** there is no
+TTL or cleanup policy for this data this sprint - a completed job's
+`input_json` stays in the table indefinitely.
+
+**Retry policy - bounded, and only for genuinely transient failures.**
+`LLMError`/`RuntimeDomainError`/`WorkflowDomainError` (rate limits,
+timeouts, invalid/inactive/misconfigured agents, invalid workflow
+definitions, malformed input) are **never retried at the job level** -
+by the time one of these reaches the worker, the underlying
+`AgentRun`/`WorkflowRun` has already been persisted terminally `failed`
+by the executor itself, so the run's own state machine no longer permits
+re-execution (and `LLMError` specifically already passed through Sprint
+P5's own gateway-level retry policy before ever surfacing this far).
+Only a genuinely unexpected exception - a worker/infrastructure-level
+bug, not a business-logic failure - triggers job-level retry, with
+exponential backoff (`job_retry_backoff_base_seconds * 2^(attempt-1)`),
+up to `job_max_attempts` (default 3) before the job is marked `failed`.
+
+**Cancellation - three tiers, see `app/jobs/service.py`'s
+`cancel_agent_run`/`cancel_workflow_run`:**
+1. `queued`/`retrying` job: cancelled immediately, then the run itself is
+   cancelled via the unchanged P6/P7 service-layer cancel. `200`.
+2. `running` **agent-run** job: `409 JobAlreadyRunningError` - a single
+   in-flight LLM Gateway call has no "between steps" checkpoint and
+   cannot be safely interrupted.
+3. `running` **workflow-run** job: `Job.cancel_requested_at` is set (a
+   cooperative timestamp, not a status-field write, so it never races
+   the worker's own concurrent status transitions on the same row) and
+   the run is returned unchanged, still `200`. The worker's
+   `execute_workflow_run` call receives an optional `cancellation_check`
+   callback (polling this same flag) that's awaited before every step;
+   once it returns `True`, the run becomes `cancelled` (not `failed`)
+   and every remaining `pending` step becomes `cancelled` too (not
+   `skipped` - that's reserved for "an earlier step failed"). Cancelling
+   an already-`cancelled` run/job is idempotent throughout.
+
+**Stale-job recovery.** Every `RUNNING` job carries a `lease_expires_at`
+(default 120s, `JOB_LEASE_SECONDS`), renewed every
+`job_heartbeat_interval_seconds` (default 15s) by a small background
+task running *concurrently* with the worker's executor call (on its own
+short-lived DB session, since `AsyncSession` isn't safe for concurrent
+use from two coroutines at once) - so a long-running job never has its
+own lease expire out from under it while a worker is still legitimately
+working on it. `app.jobs.queue.recover_stale_jobs` runs once on worker
+startup and periodically thereafter (every `max(job_lease_seconds, 30)`
+seconds): it reclaims `RUNNING` jobs whose lease has already expired
+(crash/stuck-worker recovery) back to `retrying` (if attempts remain) or
+`failed` (if exhausted) - and, by its own `WHERE lease_expires_at < now`
+filter plus `SKIP LOCKED`, it can never touch a job with a currently
+valid lease, and never replays `completed`/`failed`/`cancelled` work
+(only `RUNNING` jobs are ever eligible).
+
+**Health reporting.** `GET /api/v1/health` now also reports `queue`
+(mirrors `database` - the queue lives in the same PostgreSQL instance,
+so there is no separate broker connectivity to check) and `worker`
+(`available`/`unavailable`, based on whether any row in
+`worker_heartbeats` - a separate table from `jobs`, answering "is any
+worker process alive right now" independent of current workload - is
+fresher than `worker_heartbeat_stale_after_seconds`, default 60s). The
+`worker` Docker service has its own, separate `HEALTHCHECK`
+(`app/worker/healthcheck.py`, a small synchronous script using
+`psycopg2` directly) checking that *specific* worker process's own
+heartbeat freshness - independent of the HTTP-level check, since the
+worker container runs no HTTP server to poll.
+
+**Running the worker locally (without Docker):**
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
+# requires a running PostgreSQL reachable per your .env, with migrations applied
+python -m app.worker
+```
+
+**Known limitations (beyond the ones already called out above):** no
+scheduled/cron jobs, no parallel workflow-step execution, no DAG
+branching, no WebSocket/streaming progress updates, no human-approval
+steps, and no Kubernetes-style orchestration - single-process polling
+worker only this sprint (though safely horizontally-scalable to more
+worker replicas, thanks to `SELECT ... FOR UPDATE SKIP LOCKED`, should
+that become necessary before a real message broker is warranted).
 
 ## Local Development (without Docker)
 
@@ -590,12 +798,12 @@ Test files:
 
 | File | Covers |
 |------|--------|
-| `tests/test_health.py` | `/` and `/api/v1/health` regression |
+| `tests/test_health.py` | `/` and `/api/v1/health` regression, plus (Sprint P8) `queue`/`worker` field reporting: fresh heartbeat -> `available`, no heartbeat / stale heartbeat -> `unavailable` |
 | `tests/test_models.py` | ORM defaults, relationships, cascade delete, uniqueness constraints |
 | `tests/test_products_api.py` | Product CRUD, pagination, 404, 409, validation errors (as an authenticated operator) |
 | `tests/test_auth.py` | Registration, login, JWT issuance/expiry/signature checks, refresh token flow |
 | `tests/test_authorization.py` | Product API's viewer/operator/admin access matrix, 401s, disabled accounts |
-| `tests/test_migrations.py` | Alembic `upgrade head` / `downgrade base` / partial downgrades (to P6, to P5, to P4, to P2), one-step downgrade from head, table/column presence, revision ids |
+| `tests/test_migrations.py` | Alembic `upgrade head` / `downgrade base` / partial downgrades (to P7, to P6, to P5, to P4, to P2), one-step downgrade from head, table/column presence (including P8's `worker_heartbeats` and `jobs` queue columns), revision ids |
 | `tests/test_config.py` | JWT secret policy (dev auto-generation, persistence, never overwriting, fail loudly outside dev) and storage settings (backend validation, S3 required-fields check, MIME allowlist parsing) |
 | `tests/test_storage_local.py` | `LocalStorageBackend`: store/open/exists/delete/get_metadata, path-traversal rejection, atomic writes, idempotent delete, missing-object handling |
 | `tests/test_storage_s3.py` | `S3StorageBackend` against a mocked boto3 client: put/get/delete/head/presigned URL, error-code mapping (`NoSuchKey`/`404` → not-found, other `ClientError`s → unavailable) |
@@ -610,13 +818,19 @@ Test files:
 | `tests/test_runtime_prompt_builder.py` | `build_generate_request`: required-config enforcement (`system_prompt`/`model`), optional provider/temperature/max_tokens forwarding, context rendering into the prompt, agent id/name in `metadata` |
 | `tests/test_runtime_service.py` | `create_run`/`get_run`/`list_runs`/`cancel_run`: agent existence/active-status checks, ownership scoping (owner/non-owner/admin), pagination, cancel from `queued` and `running` (including duration computation), illegal-transition rejection from every terminal state |
 | `tests/test_runtime_executor.py` | `execute_run`: successful execution (status/output/tokens/cost/`llm_request_id` linkage to the P5 audit trail), gateway failure/timeout (run marked `failed` and re-raised), misconfigured agent, executing a non-`queued` run, context reaching the provider through the prompt |
-| `tests/test_runtime_api.py` | `/api/v1/runs/*`: auth/role matrix on `POST /runs`, error-code mapping (404/409/422/429/504), retrieval (owner/non-owner-404/admin-any, never `user_input`/`context`), list pagination/ownership scoping, cancel (401/403/404/409) |
+| `tests/test_runtime_api.py` | `/api/v1/runs/*`: auth/role matrix on `POST /runs` (Sprint P8: now asserts `202`/`queued`), enqueue-time error mapping (404/409; a misconfigured-but-active agent now still enqueues, `202`), retrieval (owner/non-owner-404/admin-any, never `user_input`/`context`), list pagination/ownership scoping, cancel (401/403/404, queued-cancel-succeeds-200, already-cancelled-409) |
 | `tests/test_workflow_models.py` | `WorkflowRun`/`WorkflowStepRun` state machines (`app.workflows.models`): every valid transition for both, illegal transitions, every terminal state accepts no further transitions, raised exceptions carry current/target |
 | `tests/test_workflow_definition.py` | `parse_workflow_steps`: valid ordered/out-of-order workflows, default mapping resolution, explicit `step_output`/`static`/`workflow_input` mappings, empty/missing/non-list steps, duplicate step ids/order, missing/malformed agent id, malformed step shape, forward-reference/self-reference/missing-step_id `step_output` rejection, unsupported mapping source, non-object `input_mapping`, `previous_output` on the first step |
 | `tests/test_workflow_input_builder.py` | `build_step_input`: all four mapping sources, deterministic output for identical inputs, `previous_output` with no preceding step, missing `previous_output`/`step_output` references at runtime |
 | `tests/test_workflow_service.py` | `create_workflow_run`/`get_run`/`list_runs`/`get_steps`/`cancel_run`/`get_active_workflow`: workflow existence/active-status checks, definition validation, referenced-agent existence/active-status checks, ownership scoping, pagination, step-run ordering, cancel from `queued` (cancels pending steps) and `running` (only cancels still-pending steps), idempotent re-cancel, illegal-transition rejection from `completed`/`failed` |
 | `tests/test_workflow_executor.py` | `execute_workflow_run`: one-step and multi-step success (output propagation, named `step_output` references, final-output persistence), first-step and middle-step failure (remaining steps `skipped`), timeout/runtime-failure mapping, every step links to a real P6 `AgentRun`, workflow context reaching every step's prompt |
-| `tests/test_workflow_run_api.py` | `/api/v1/workflow-runs/*`: auth/role matrix on `POST /workflow-runs`, error-code mapping (404/409/422/429/504), retrieval (owner/non-owner-404/admin-any, never `user_input`/`context`), list pagination/ownership scoping, step listing (owner/non-owner-404), cancel (401/403/404/409) |
+| `tests/test_workflow_run_api.py` | `/api/v1/workflow-runs/*`: auth/role matrix on `POST /workflow-runs` (Sprint P8: now asserts `202`/`queued`), enqueue-time error mapping (404/409/422), retrieval (owner/non-owner-404/admin-any, never `user_input`/`context`), list pagination/ownership scoping, step listing (owner/non-owner-404, steps stay `pending` until executed), cancel (401/403/404, queued-cancel-succeeds-200, already-cancelled-idempotent-200) |
+| `tests/test_job_models.py` | `Job` state machine (`app.jobs.models.validate_job_transition`): every valid transition (including `retrying`), illegal transitions, every terminal state accepts no further transitions, raised exception carries current/target |
+| `tests/test_job_queue.py` | `app.jobs.queue`: `claim_next_job` (oldest-first, skips not-yet-due `retrying` jobs, claims due ones, never claims `running`/terminal jobs, preserves `started_at` across retries), `renew_lease`, `mark_completed`/`mark_failed`/`mark_retrying`/`mark_failed_or_retry` (retry-vs-fail branching on `attempt_count`), `compute_backoff_seconds` (exponential), `mark_cancelled`/`cancel_queued_job`, `recover_stale_jobs` (never touches a valid lease, reclaims an expired one to `retrying` or `failed`, never replays `completed` work, idempotent) |
+| `tests/test_job_service.py` | `app.jobs.service`: `enqueue_agent_run`/`enqueue_workflow_run` (atomic single-commit run+job creation, enqueue-time validation failures create neither row), `cancel_agent_run`/`cancel_workflow_run`'s full three-tier design (queued-cancels-both, running-agent-run-raises-`JobAlreadyRunningError`, running-workflow-run-sets-`cancel_requested_at`-idempotently, no-paired-job-falls-through-to-P6/P7-cancel-unchanged) |
+| `tests/test_worker_dispatch.py` | `app.worker.dispatch.process_claimed_job`: agent/workflow success (proves reuse of the unmodified P6/P7 executors via provider/token/output fields only they set), domain failures (`LLMError`/`AgentConfigurationError`) fail the job immediately with no retry, a genuinely unexpected exception retries (and eventually fails once `max_attempts` is exhausted), duplicate delivery (target run already `completed`) skips re-execution, a `cancelled` target run marks the job `cancelled`, a workflow job honors `cancel_requested_at` between steps |
+| `tests/test_worker_runner.py` | `app.worker.runner`: `default_worker_id` (env var vs. hostname fallback), `upsert_heartbeat` (insert then update), `process_one_job` (empty queue vs. real claim-and-complete), `_heartbeat_while_running` (extends the lease while "executing", stops once the job is no longer `running`), `run_worker`'s startup stale-job recovery pass and its own `worker_heartbeats` row |
+| `tests/test_worker_healthcheck.py` | `app.worker.healthcheck.is_healthy`: no heartbeat row -> unhealthy, fresh heartbeat -> healthy, stale heartbeat -> unhealthy, unreachable database -> unhealthy (fails fast, not via TCP timeout) |
 
 Each test gets its own database transaction (via `tests/conftest.py`'s
 `db_session`/`client` fixtures) that is rolled back afterward, so tests
@@ -630,19 +844,25 @@ repo-root `verify.sh` script (see below). See
 [`docs/P1_LOCAL_VERIFICATION.md`](docs/P1_LOCAL_VERIFICATION.md) for
 exact commands, expected output, the full verification history, and the
 follow-up fixes each sprint's real local run caught (P4: `9214d51`,
-`2d7a5e1`; P5: `b1751fe`, which also introduced `verify.sh`). Sprint P6's
-and Sprint P7's test files above were both written in the same sandbox
-(no Docker, no network) and validated only via `python -m py_compile` -
-neither has yet been executed by pytest; that's the next step, in Parts
-F and G of `docs/P1_LOCAL_VERIFICATION.md`. Per explicit CTO instruction,
-P7 was implemented immediately after P6 without waiting for P6's real
-local verification first - both sprints' `./verify.sh` results are
-outstanding simultaneously.
+`2d7a5e1`; P5: `b1751fe`, which also introduced `verify.sh`). Sprint P6,
+P7, and P8's test files above were all written in the same sandbox (no
+Docker, no network) and validated only via `python -m py_compile` plus a
+manual unused-import/line-length sweep - none has yet been executed by
+pytest; that's the next step, in Parts F, G, and H of
+`docs/P1_LOCAL_VERIFICATION.md`. Per explicit CTO instruction, P7 was
+implemented immediately after P6, and P8 immediately after P7, each time
+without waiting for the prior sprint's real local verification first -
+all three sprints' `./verify.sh` results are outstanding simultaneously
+as of P8.
 
 `verify.sh` (repo root) runs `docker compose ps`, `alembic current`,
-`pytest -v`, `ruff check .`, `mypy app`, and `git status --short` in
-sequence, stopping at the first failing step (`set -euo pipefail`), and
-prints `ALL CHECKS PASSED` only on a genuine clean run:
+`pytest -v`, `ruff check .`, `mypy app`, (Sprint P8) an explicit check
+that the `worker` container's own Docker `HEALTHCHECK` reports
+`healthy`, a `docker compose logs worker` tail for visibility, a `GET
+/api/v1/health` check asserting `database`/`queue`/`worker` are all
+`connected`/`connected`/`available`, and finally `git status --short` -
+in sequence, stopping at the first failing step (`set -euo pipefail`),
+and prints `ALL CHECKS PASSED` only on a genuine clean run:
 
 ```bash
 ./verify.sh
@@ -665,17 +885,23 @@ prints `ALL CHECKS PASSED` only on a genuine clean run:
 5. LLM Gateway - **P5, verified locally, CTO approved**
 6. AI Runtime - **P6, built, statically validated (`py_compile`), awaiting CTO local verification**
 7. Workflow Orchestration - **P7, built, statically validated (`py_compile`), awaiting CTO local verification**
-8. MCP Integration
-9. RAG
-10. Product Factory
-11. Marketplace Automation
-12. Deployment
-13. MVP Launch
+8. Asynchronous Job Execution - **P8, built, statically validated (`py_compile`), awaiting CTO local verification**
+9. MCP Integration
+10. RAG
+11. Product Factory
+12. Marketplace Automation
+13. Deployment
+14. MVP Launch
 
 The vault's original item 7 was "MCP Integration" - per explicit CTO
 instruction, Workflow Orchestration was moved ahead of it and implemented
 as Sprint P7 instead (also noted in `app/models/workflow_definition.py`'s
 docstring, which originally expected orchestration to start at a later
-"Product Factory" sprint). MCP Integration and RAG shift down to items 8
-and 9 accordingly. Sprint P8 does not begin until both P6 and P7 are
-verified locally and approved.
+"Product Factory" sprint), and Asynchronous Job Execution was similarly
+inserted as Sprint P8 - moving synchronous P6/P7 execution onto a durable
+background worker before MCP/RAG/Product Factory build further on top of
+it. MCP Integration and RAG shift down to items 9 and 10 accordingly. Per
+explicit CTO instruction, P8 began immediately after P7 without waiting
+for either P6's or P7's local verification first - do not begin Sprint
+P9 until Sprints P6, P7, and P8 have all been verified locally and
+approved.
