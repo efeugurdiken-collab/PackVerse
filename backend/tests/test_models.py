@@ -124,7 +124,12 @@ async def test_job_creation_applies_defaults(db_session: AsyncSession) -> None:
     await db_session.commit()
     await db_session.refresh(job)
 
-    assert job.status == JobStatus.PENDING
+    # Sprint P8 renamed this table's original P2 placeholder status
+    # values (PENDING/SUCCEEDED) to QUEUED/COMPLETED (plus added
+    # RETRYING) to match the async job queue's exact required lifecycle -
+    # see app/models/enums.py's JobStatus docstring. QUEUED is the
+    # correct default now; PENDING no longer exists as a member.
+    assert job.status == JobStatus.QUEUED
     assert job.output_json is None
     assert job.started_at is None
     assert job.completed_at is None

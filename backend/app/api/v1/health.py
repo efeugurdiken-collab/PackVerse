@@ -72,7 +72,18 @@ async def health_check(
     settings: Settings = Depends(get_settings),
 ) -> HealthResponse:
     db_ok = await check_database_connection()
-    worker_ok = await _check_worker_available(db, settings) if db_ok else False
+    # Deliberately NOT gated behind db_ok: check_database_connection()
+    # opens its own separate connection from app.database.session's
+    # module-level `engine` (bound to settings.database_url, the "main"
+    # database) - a different connection than `db` above (which came
+    # through the get_db dependency and is what actually has visibility
+    # into whatever transaction wrote the heartbeat, including in tests,
+    # where `db` is overridden to an isolated session but the module-level
+    # `engine` is not and cannot be). Worker availability only needs `db`
+    # to be usable, which _check_worker_available's own try/except already
+    # guards - it must not additionally depend on that unrelated, separate
+    # connection succeeding.
+    worker_ok = await _check_worker_available(db, settings)
     return HealthResponse(
         status="ok" if db_ok else "degraded",
         database="connected" if db_ok else "unreachable",

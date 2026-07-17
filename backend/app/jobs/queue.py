@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.jobs.exceptions import InvalidJobTransitionError
 from app.jobs.models import validate_job_transition
 from app.models.enums import JobStatus
 from app.models.job import Job
@@ -181,7 +182,18 @@ async def cancel_queued_job(db: AsyncSession, job: Job) -> None:
     """Valid from QUEUED or RETRYING only - a RUNNING job cannot be
     cancelled this way (see app/jobs/service.py's cancel_agent_run/
     cancel_workflow_run for how a RUNNING job's cancellation is
-    requested instead)."""
+    requested instead).
+
+    Deliberately does not rely on validate_job_transition alone: RUNNING
+    -> CANCELLED is legal in the *general* state machine (mark_cancelled
+    above uses exactly that transition, for the separate worker-initiated
+    cancellation path), so the shared transition table cannot by itself
+    reject a RUNNING job here without also breaking mark_cancelled. This
+    function instead enforces its own narrower, function-specific origin
+    rule first - QUEUED/RETRYING only - before ever consulting the
+    transition table, so the general state machine stays untouched."""
+    if job.status not in (JobStatus.QUEUED, JobStatus.RETRYING):
+        raise InvalidJobTransitionError(job.status, JobStatus.CANCELLED)
     validate_job_transition(job.status, JobStatus.CANCELLED)
     now = datetime.now(timezone.utc)
     job.status = JobStatus.CANCELLED
