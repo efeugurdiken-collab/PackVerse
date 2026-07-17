@@ -1,13 +1,15 @@
-# Local Verification (P1-P5)
+# Local Verification (P1-P6)
 
-**Status: P1, P2, P3, P4 verified locally. P5 not yet verified.** Parts
-A, B, and D below are historical record of runs already completed
-against a real PostgreSQL instance (P4 required two follow-up fixes - a
-missing `pathlib` import and a `MissingGreenlet`/identity-map test bug,
-both resolved and re-verified). Part E below is the reproduction guide
-for Sprint P5, awaiting its first real local run. This document exists
-because the environment this code was written in cannot run it, and the
-CTO instruction for every sprint in this repo has been explicit: do not
+**Status: P1, P2, P3, P4, P5 verified locally. P6 not yet verified.**
+Parts A, B, D, and E below are historical record of runs already
+completed against a real PostgreSQL instance (P4 required two follow-up
+fixes - a missing `pathlib` import and a `MissingGreenlet`/identity-map
+test bug; P5 required two more - an invalid `noqa` directive and two
+stale/inverted migration-test assertions - all four resolved and
+re-verified). Part F below is the reproduction guide for Sprint P6,
+awaiting its first real local run. This document exists because the
+environment this code was written in cannot run it, and the CTO
+instruction for every sprint in this repo has been explicit: do not
 claim a sprint passed, and give exact reproducible steps instead.
 
 ## Why verification could not run here
@@ -321,14 +323,32 @@ explicitly approved. (It has since been approved; see Part E below.)
 
 ## Part E — Sprint P5 (LLM Gateway)
 
-**Not yet verified.** Written and statically validated
-(`python -m py_compile` across `app/` and `tests/`, no runtime
-execution) in the same no-Docker, no-network sandbox as every prior
-sprint. Needs a real local run before it can be marked verified - same
-discipline as Parts C and D: don't accept a claimed pass without actual
-pasted command output, cross-checked numerically against the P4
-baseline (129 passed / 47 mypy-clean source files) before trusting a
-delta.
+**Verified.** Final confirmed result (via `verify.sh`, added during this
+sprint's verification round): `218 passed, 2 warnings` (pytest, same 2
+pre-existing Starlette deprecation notices as P4), `All checks passed!`
+(ruff), `Success: no issues found in 64 source files` (mypy), commit
+`b1751fe`.
+
+Two issues were found and fixed during verification before this final
+pass: an invalid `# noqa: broad on purpose - see docstring` directive in
+`app/llm/gateway.py` (ruff flagged it as malformed - `noqa` needs an
+actual rule code, not free text) fixed to a plain comment; and two
+stale/inverted assertions in `tests/test_migrations.py`'s downgrade
+tests, both root-caused from real pytest tracebacks rather than
+guessed - `test_migration_downgrade_to_p2_preserves_domain_tables`
+wasn't excluding the newly-added `llm_requests` table from its
+post-downgrade-to-P2 expectation, and
+`test_migration_downgrade_to_p4_removes_only_p4_columns` had an
+inverted `isdisjoint` check left over from renaming an earlier
+"downgrade one step FROM P4" test into a "downgrade TO P4" test - it
+was asserting P4's own columns should be *absent* at a revision where
+P4 is still fully applied. No migration files needed changes for
+either fix - both bugs were in test expectations only.
+
+Same reset discipline as Parts C/D applies: run `docker compose down`
+then `docker compose up --build -d` first, so the newly added `httpx`,
+`jsonschema`, and `pytest-httpx`/`types-jsonschema` dependencies are
+actually installed before testing.
 
 Same reset discipline as Parts C/D applies: run `docker compose down`
 then `docker compose up --build -d` first, so the newly added `httpx`,
@@ -446,10 +466,131 @@ default); `/providers` lists `fake` with `"configured": true`;
 
 ## Acceptance (P5)
 
-**Unverified pending a real local run.** Once every command in Part E
+All commands in Part E have been run against a real PostgreSQL instance
+and produced the expected output (`218 passed`, ruff clean, mypy clean
+on 64 source files), via `verify.sh`. Per CTO instruction: Sprint P6 (AI
+Runtime) still does not start until this is explicitly approved. (It has
+since been approved; see Part F below.)
+
+## Part F — Sprint P6 (AI Runtime)
+
+**Not yet verified.** Written and statically validated
+(`python -m py_compile` across `app/` and `tests/`, no runtime
+execution) in the same no-Docker, no-network sandbox as every prior
+sprint. Needs a real local run before it can be marked verified - same
+discipline as every prior part: don't accept a claimed pass without
+actual pasted command output, cross-checked numerically against the P5
+baseline (218 passed / 64 mypy-clean source files) before trusting a
+delta.
+
+Same reset discipline as prior parts applies: run `docker compose down`
+then `docker compose up --build -d` first, so the container picks up
+the new `app/runtime/` package and `agent_runs` migration cleanly. No
+new third-party dependencies were added this sprint.
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current            # -> a1c8f7d2b3e9 (head)
+docker compose exec backend alembic downgrade -1        # drops only the agent_runs table
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade 7c19e4b8a2d6   # back to P5 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `a1c8f7d2b3e9 (head)` after the first upgrade; the `downgrade
+-1` step removes only the `agent_runs` table while every P2-P5 table and
+column stays intact (spot-check with
+`docker compose exec db psql -U packverse -d packverse -c '\dt'` -
+`agent_runs` should be the only table to disappear, and `llm_requests`
+should still be present); the final `downgrade base` / `upgrade head`
+pair proves the whole five-migration chain still runs cleanly end to
+end.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_runtime_models.py`,
+`test_runtime_prompt_builder.py`, `test_runtime_service.py`,
+`test_runtime_executor.py`, and `test_runtime_api.py` passes, plus the
+P6 additions to `test_migrations.py`, on top of all P1-P5 tests
+continuing to pass unmodified (regression). Roughly 218 (P1-P5 baseline)
++ ~65 new P6 tests. No test in this sprint makes a real network call -
+every runtime test routes through the `fake` LLM provider, the same way
+`test_llm_api.py` does.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` → "All checks passed!"; `mypy app` → "Success: no
+issues found in N source files" where N is larger than P5's 64 (new
+files: `app/runtime/{__init__,exceptions,models,prompt_builder,service,executor}.py`,
+`app/models/agent_run.py`, `app/schemas/runtime.py`, `app/api/v1/runs.py`).
+
+### 4. Manual smoke test (optional but recommended, no API key needed)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# There is no AgentDefinition CRUD API - seed one directly:
+docker compose exec db psql -U packverse -d packverse -c \
+  "INSERT INTO agent_definitions (id, name, role, version, status, configuration_json, created_at, updated_at) VALUES (gen_random_uuid(), 'smoke-test-agent', 'Tester', 'v1.0', 'active', '{\"system_prompt\": \"You are helpful.\", \"model\": \"fake-v1\"}', now(), now()) RETURNING id;"
+# copy the returned id into AGENT_ID below
+
+curl -s -X POST http://localhost:8000/api/v1/runs \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent_id":"'"$AGENT_ID"'","user_input":"hello"}'
+
+curl -s http://localhost:8000/api/v1/runs -H "Authorization: Bearer $TOKEN"
+```
+
+Expected: the `POST /runs` call returns `201` with `"status":"completed"`
+and an `output_text` field (the fake provider's deterministic echo);
+`GET /runs` lists it.
+
+### If it fails
+
+- **`alembic downgrade -1` from head errors on dropping the FK
+  constraint**: check that the constraint name matches exactly what the
+  upgrade created (`fk_agent_runs_created_by_user_id_users` /
+  `fk_agent_runs_llm_request_id_llm_requests` /
+  `fk_agent_runs_agent_id_agent_definitions`) - PostgreSQL is
+  case-sensitive here.
+- **`test_runtime_executor.py` failures around token/cost fields**:
+  confirm the run actually reached `COMPLETED` (check `error_code` in
+  the failure output first) - a routing/config issue upstream in the
+  LLM Gateway settings would surface here as a `FAILED` run rather than
+  a missing-field error.
+- **`test_runtime_api.py` failures around dependency overrides**: same
+  shape as `test_llm_api.py` - confirm
+  `app.dependency_overrides[get_settings]`/`[get_llm_gateway]` are being
+  cleared between tests via the `client` fixture.
+- **`mypy` failures in `app/runtime/executor.py` around
+  `created_by_user_id`**: this field is nullable on `AgentRun` (mirrors
+  `llm_requests.user_id`'s `ON DELETE SET NULL`); the executor narrows
+  it to a local `owner_id` variable before use specifically so mypy can
+  prove it's non-`None` at the `generate_and_persist` call site - if a
+  future edit removes that narrowing, expect a mypy failure there, not
+  a bug in `llm_service.py`.
+
+## Acceptance (P6)
+
+**Unverified pending a real local run.** Once every command in Part F
 above has been run against a real PostgreSQL instance and produced the
 expected output, update this section (and the README's Roadmap/status
 blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
-hash, the same way Parts C and D were updated after their first real
-runs. Per CTO instruction: Sprint P6 (AI Runtime) does not start until
-this is explicitly approved.
+hash, the same way every prior part was updated after its first real
+run. Per CTO instruction: Sprint P7 (MCP Integration) does not start
+until this is explicitly approved.

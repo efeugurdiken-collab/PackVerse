@@ -32,7 +32,8 @@ from app.core.security import create_access_token, hash_password
 from app.database.session import get_db
 from app.main import app
 from app.models import Base
-from app.models.enums import ProductStatus, ProductType, UserRole, UserStatus
+from app.models.agent_definition import AgentDefinition
+from app.models.enums import AgentStatus, ProductStatus, ProductType, UserRole, UserStatus
 from app.models.product import Product
 from app.models.user import User
 from app.storage.base import StorageBackend
@@ -190,6 +191,44 @@ def make_product(
         return product
 
     return _make_product
+
+
+@pytest.fixture
+def make_agent_definition(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[AgentDefinition]]:
+    """Factory fixture: `await make_agent_definition()` inserts an
+    AgentDefinition directly via the ORM and returns it - there is no
+    AgentDefinition CRUD API in this codebase (definitions are seeded
+    from the vault, per app/schemas/agent_definition.py's docstring), so
+    Sprint P6's runtime tests need this the same way asset tests needed
+    make_product. Defaults to a valid, ACTIVE, fully-configured agent -
+    see app/runtime/prompt_builder.py for the configuration_json
+    convention (system_prompt/model required)."""
+
+    async def _make_agent_definition(
+        *,
+        name: str | None = None,
+        role: str = "Test Agent",
+        status: AgentStatus = AgentStatus.ACTIVE,
+        configuration_json: dict[str, object] | None = None,
+    ) -> AgentDefinition:
+        agent = AgentDefinition(
+            name=name or f"agent-{uuid.uuid4().hex[:10]}",
+            role=role,
+            status=status,
+            configuration_json=(
+                configuration_json
+                if configuration_json is not None
+                else {"system_prompt": "You are a helpful test agent.", "model": "fake-v1"}
+            ),
+        )
+        db_session.add(agent)
+        await db_session.commit()
+        await db_session.refresh(agent)
+        return agent
+
+    return _make_agent_definition
 
 
 @pytest.fixture

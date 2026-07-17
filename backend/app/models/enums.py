@@ -100,3 +100,18 @@ class LLMRequestStatus(str, Enum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class AgentRunStatus(str, Enum):
+    """Lifecycle of a single AgentDefinition execution (Sprint P6: AI
+    Runtime). QUEUED is set the instant the row is created, before
+    anything runs. The allowed QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED
+    transitions are enforced by app/runtime/models.py's state machine,
+    not just documented here - see that module for the exact transition
+    table."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
