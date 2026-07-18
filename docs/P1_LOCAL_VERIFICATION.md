@@ -929,3 +929,146 @@ blockquote) to reflect the confirmed pytest/ruff/mypy results and commit
 hash, the same way every prior part was updated after its first real
 run. Per explicit CTO instruction: do not start Sprint P9 until P6, P7,
 and P8 are all explicitly approved.
+
+## Part I — Sprint P9 (MCP Integration: P9A/P9B/P9C1/P9C2)
+
+Unlike every prior sprint, P9 was written and verified in the same
+Docker-based environment throughout (not a no-Docker/no-network
+sandbox), across four separately-committed, separately-CI-verified
+phases: P9A (LLM Gateway tool-calling), P9B (MCP client, `app/mcp/`),
+P9C1 (bounded LLM<->MCP tool-call loop in `app/runtime/executor.py`),
+and P9C2 (trace persistence + usage aggregation on top of P9C1's loop).
+Each phase's own `docker compose exec backend pytest -v` / `ruff check
+.` / `mypy app` / `./verify.sh` run, plus its GitHub Actions `ci.yml`
+run, are the historical record - see the git log for the four commit
+messages, each stating its own pass/fail numbers. This Part re-verifies
+the combined result at P9C2's head.
+
+Same reset discipline as prior parts applies: run `docker compose down`
+then `docker compose up --build -d` first. No new third-party
+dependencies were added across any of the four P9 phases - the MCP
+client (P9B) is hand-rolled over the already-present `httpx` dependency,
+the same choice already made for the Anthropic/OpenAI adapters.
+
+### 1. Migration
+
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic current              # -> d657afc740be (head)
+docker compose exec backend alembic downgrade -1          # drops only agent_runs.tool_calls_json
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade b7f3e9a1c5d2   # back to P8 head
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic downgrade base
+docker compose exec backend alembic upgrade head
+```
+
+Expected: `d657afc740be (head)` after the first upgrade; the `downgrade
+-1` step removes only `agent_runs.tool_calls_json` while every other
+`agent_runs` column and every P1-P8 table (including `worker_heartbeats`
+and the nine P8 `jobs` columns) stays intact (spot-check with
+`docker compose exec db psql -U packverse -d packverse -c '\d
+agent_runs'`); the final `downgrade base` / `upgrade head` pair proves
+the whole nine-migration chain still runs cleanly end to end. P9A and
+P9B added no migrations of their own - `d657afc740be`'s `down_revision`
+is `b7f3e9a1c5d2` (P8's own head), unchanged since P8.
+
+### 2. Full test suite
+
+```bash
+docker compose exec backend pytest -v
+```
+
+Expected: every test in `test_llm_fake_provider.py`,
+`test_llm_anthropic_adapter.py`, `test_llm_openai_adapter.py`,
+`test_llm_gateway.py`, and `test_llm_api.py`'s P9A-era tool-calling
+additions passes (P9A); every test in `test_mcp_client.py` and
+`test_mcp_api.py` passes (P9B); every test in
+`test_runtime_tool_loop.py` passes (P9C1/P9C2 - the bounded loop,
+trace persistence, usage aggregation, and every partial-trace-on-failure
+scenario), plus the P9C2 additions to `test_migrations.py`, on top of
+all P1-P8 tests continuing to pass unmodified (regression). 593 passed
+as of P9C2's own local verification (583 P9B baseline + 10 in
+`test_runtime_tool_loop.py`, 9 of the original 583 being P9C1's own
+tests replaced/extended by P9C2 - net +3 new tests - see that sprint's
+commit message for the exact breakdown). No test in any of the four
+phases makes a real network call - every MCP call routes through
+`httpx_mock`-mocked HTTP responses, and every LLM call routes through
+the `fake` provider, same as every prior sprint's own tests.
+
+### 3. Lint and type checks
+
+```bash
+docker compose exec backend ruff check .
+docker compose exec backend mypy app
+```
+
+Expected: `ruff check` -> "All checks passed!"; `mypy app` -> "Success:
+no issues found in 102 source files" (new files across the four phases:
+`app/mcp/{__init__,models,exceptions,client,factory}.py`,
+`app/api/v1/mcp.py`, `app/schemas/mcp.py`).
+
+### 4. Manual smoke test (optional but recommended, no API key or real MCP server strictly required)
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"..."}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# Point at a real MCP server reachable over Streamable HTTP if you have
+# one; MCP_SERVERS_JSON defaults to [] otherwise (GET /mcp/servers will
+# just return an empty list, and no agent's mcp_server key will resolve).
+curl -s http://localhost:8000/api/v1/mcp/servers -H "Authorization: Bearer $TOKEN"
+
+# There is no AgentDefinition CRUD API - seed one directly, this time
+# with an mcp_server key naming a real MCP_SERVERS_JSON entry:
+docker compose exec db psql -U packverse -d packverse -c \
+  "INSERT INTO agent_definitions (id, name, role, version, status, configuration_json, created_at, updated_at) VALUES (gen_random_uuid(), 'smoke-test-agent-p9', 'Tester', 'v1.0', 'active', '{\"system_prompt\": \"You are helpful.\", \"model\": \"fake-v1\", \"provider\": \"fake\", \"mcp_server\": \"<your-server-name>\"}', now(), now()) RETURNING id;"
+
+curl -s -X POST http://localhost:8000/api/v1/runs \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"agent_id":"'"$AGENT_ID"'","user_input":"hello"}'
+# -> 202 Accepted, {"status":"queued", ...}
+
+sleep 2
+curl -s http://localhost:8000/api/v1/runs/$RUN_ID -H "Authorization: Bearer $TOKEN"
+```
+
+Expected: `GET /runs/{id}` shows `"status":"completed"` and, if the
+model actually called a tool, a populated `tool_calls_json` array plus
+`input_tokens`/`output_tokens`/`estimated_cost_usd` reflecting every LLM
+call the run's loop made, not just the last one. An agent seeded without
+an `mcp_server` key behaves exactly as it did before Sprint P9 -
+`tool_calls_json` stays `null`.
+
+### If it fails
+
+- **`alembic downgrade -1` from head errors dropping the column**: check
+  that `d657afc740be`'s `downgrade()` matches what its `upgrade()`
+  created - this should already be correct as committed, but
+  double-check if a manual edit ever touches that file.
+- **`test_runtime_tool_loop.py` failures around `tool_calls_json`
+  contents**: confirm the run actually reached the expected terminal
+  state first (`error_code` in the failure output narrows it down to
+  which of the loop's several raise points fired) - a routing/config
+  issue upstream in the LLM Gateway or MCP settings would surface here
+  as an unexpected `FAILED` rather than a shape mismatch.
+- **`mypy` failures around `_ToolLoopUsage`/`_persist_tool_loop_usage`
+  in `app/runtime/executor.py`**: confirm `Decimal | None`'s
+  sticky-`None` guard (`elif self.total_cost_usd is not None:`) hasn't
+  been simplified away - removing it would let a later known-cost call
+  silently resurrect an aggregate that should stay `None` once any
+  earlier call's cost was unknown.
+
+## Acceptance (P9)
+
+**Unverified pending a real local run against this exact document.**
+Each of P9A/P9B/P9C1/P9C2's own commits already ran the commands above
+against a real PostgreSQL instance in CI and locally at the time they
+were written (see each commit message for its own numbers) - this
+Part's role is to let the CTO reproduce the combined result at
+P9C2's head in one pass, the same discipline as every prior part. Once
+reproduced, update this section, the README's Roadmap line for item 9,
+and the P1-P8 status blockquote at the top of this document (still
+stale as of this writing - see the note in the project's own
+conversation history) to reflect confirmed results and a commit hash.

@@ -26,6 +26,20 @@ class AgentRunCreate(BaseModel):
     context: dict[str, object] | None = None
 
 
+class ToolCallTrace(BaseModel):
+    """One entry of AgentRun.tool_calls_json (Sprint P9C2) - one MCP
+    tool call made during this run's bounded tool-call loop. See
+    app/runtime/executor.py's _run_tool_loop for exactly when/how each
+    entry is appended, including on a run that ultimately failed."""
+
+    iteration: int
+    llm_request_id: uuid.UUID | None
+    tool_name: str
+    arguments: dict[str, object]
+    result: str
+    is_error: bool
+
+
 class AgentRunRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -41,6 +55,7 @@ class AgentRunRead(BaseModel):
     total_tokens: int | None
     estimated_cost_usd: Decimal | None
     output_text: str | None
+    tool_calls_json: list[ToolCallTrace] | None
     error_code: str | None
     error_message: str | None
     duration_ms: int | None

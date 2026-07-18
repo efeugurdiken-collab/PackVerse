@@ -20,19 +20,24 @@ LLM <-> MCP tool-call loop (see _run_tool_loop below) when the agent's
 configuration_json names an mcp_server - see
 app/runtime/prompt_builder.py's convention. An agent with no mcp_server
 configured is completely unaffected: exactly one LLM Gateway call, the
-same as every run before this sprint. This phase deliberately does not
-persist a tool-call trace or aggregate token/cost across a multi-call
-run's several llm_requests rows - see app/models/agent_run.py; a run's
-provider/model/tokens/cost/llm_request_id always mirror its FINAL LLM
-call only, the same shape this file has always had. A later phase may
-add trace persistence and aggregation on top of this without changing
-execute_run's public signature again.
+same as every run before this sprint.
+
+Sprint P9C2 adds trace persistence and usage aggregation on top of
+P9C1's loop, via _ToolLoopUsage (accumulated by _run_tool_loop as it
+goes) and _persist_tool_loop_usage (which writes it onto `run` - shared
+by both the success and failure branches below, so a run that fails
+partway through a multi-call loop still persists whatever tool calls
+and token/cost usage completed before the failure). See
+app/models/agent_run.py's module docstring for the exact field
+semantics this introduces.
 """
 from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,6 +56,53 @@ from app.runtime.prompt_builder import build_generate_request
 from app.runtime.service import get_active_agent
 from app.schemas.llm import GenerateResponse, MessageIn, ToolDefinitionIn
 from app.services import llm_service
+
+
+@dataclass
+class _ToolLoopUsage:
+    """Accumulates trace/token/cost data across every LLM call
+    _run_tool_loop makes for one run (Sprint P9C2) - mutated as the loop
+    goes, and read by execute_run after the loop either returns or
+    raises, via _persist_tool_loop_usage below.
+
+    total_cost_usd is "sticky-None": once any single call's own cost is
+    unknown, the whole run's aggregate becomes (and stays) unknown too -
+    never a fabricated partial total. calls_made distinguishes "zero
+    calls happened at all" (e.g. an unconfigured mcp_server failing
+    before any call was attempted) from "calls happened but summed to
+    zero", so _persist_tool_loop_usage can leave every field None in the
+    former case rather than writing a misleading 0/[].
+    """
+
+    trace: list[dict[str, object]] = field(default_factory=list)
+    calls_made: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: Decimal | None = Decimal("0")
+
+    def record_call(self, response: GenerateResponse) -> None:
+        self.calls_made += 1
+        self.total_input_tokens += response.input_tokens
+        self.total_output_tokens += response.output_tokens
+        if response.estimated_cost_usd is None:
+            self.total_cost_usd = None
+        elif self.total_cost_usd is not None:
+            self.total_cost_usd += response.estimated_cost_usd
+
+
+def _persist_tool_loop_usage(run: AgentRun, usage: _ToolLoopUsage) -> None:
+    """Writes accumulated token/cost/trace fields onto `run` - shared by
+    both execute_run's success and failure branches so the two paths
+    can never drift apart. A no-op if no LLM call ever completed
+    (usage.calls_made == 0), leaving those fields at their natural
+    None default rather than a fabricated zero/empty list."""
+    if usage.calls_made == 0:
+        return
+    run.input_tokens = usage.total_input_tokens
+    run.output_tokens = usage.total_output_tokens
+    run.total_tokens = usage.total_input_tokens + usage.total_output_tokens
+    run.estimated_cost_usd = usage.total_cost_usd
+    run.tool_calls_json = usage.trace or None
 
 
 async def execute_run(
@@ -87,6 +139,7 @@ async def execute_run(
     await db.commit()
 
     started = time.monotonic()
+    usage = _ToolLoopUsage()
     try:
         owner_id = run.created_by_user_id
         if owner_id is None:
@@ -106,12 +159,14 @@ async def execute_run(
             user_input=user_input,
             context=context,
             owner_id=owner_id,
+            usage=usage,
         )
     except (LLMError, RuntimeDomainError, MCPError) as exc:
         validate_transition(run.status, AgentRunStatus.FAILED)
         run.status = AgentRunStatus.FAILED
         run.error_code = type(exc).__name__
         run.error_message = str(exc)
+        _persist_tool_loop_usage(run, usage)
         run.duration_ms = int((time.monotonic() - started) * 1000)
         run.completed_at = datetime.now(timezone.utc)
         db.add(run)
@@ -131,11 +186,8 @@ async def execute_run(
     run.llm_request_id = uuid.UUID(response.request_id)
     run.provider = response.provider
     run.model = response.model
-    run.input_tokens = response.input_tokens
-    run.output_tokens = response.output_tokens
-    run.total_tokens = response.total_tokens
-    run.estimated_cost_usd = response.estimated_cost_usd
     run.output_text = response.content
+    _persist_tool_loop_usage(run, usage)
     run.duration_ms = int((time.monotonic() - started) * 1000)
     run.completed_at = datetime.now(timezone.utc)
     db.add(run)
@@ -153,11 +205,22 @@ async def _run_tool_loop(
     user_input: str,
     context: dict[str, object] | None,
     owner_id: uuid.UUID,
+    usage: _ToolLoopUsage,
 ) -> GenerateResponse:
     """Sprint P9C1: the bounded LLM <-> MCP tool-call loop. Returns the
     final GenerateResponse once the model stops requesting tools. An
     agent with no mcp_server in configuration_json makes exactly one
     call here, identical to this file's pre-P9C1 behavior.
+
+    Sprint P9C2: mutates `usage` as it goes - one record_call() per LLM
+    call that actually returns (a call that raises contributes nothing),
+    and one trace entry appended immediately after each individual tool
+    call succeeds, before the next tool call (or iteration) is
+    attempted. This is what makes partial trace/usage survive a failure
+    partway through a batch of tool calls or partway through the loop:
+    whatever was appended before the failure is already sitting in
+    `usage`, which execute_run's except block reads regardless of how
+    this function exits.
 
     Tool results are threaded back as a synthesized plain-text `user`
     message ("Tool 'x' was called with {...} and returned: ...") rather
@@ -189,10 +252,11 @@ async def _run_tool_loop(
         agent=agent, user_input=user_input, context=context, tools=tools
     )
 
-    for _ in range(settings.runtime_max_tool_iterations):
+    for iteration in range(1, settings.runtime_max_tool_iterations + 1):
         response = await llm_service.generate_and_persist(
             db, gateway, settings, payload=payload, user_id=owner_id
         )
+        usage.record_call(response)
         if not response.tool_calls:
             return response
 
@@ -205,6 +269,16 @@ async def _run_tool_loop(
         follow_up_messages = list(payload.messages)
         for call in response.tool_calls:
             result = await mcp_client.call_tool(call.name, call.arguments)
+            usage.trace.append(
+                {
+                    "iteration": iteration,
+                    "llm_request_id": response.request_id,
+                    "tool_name": call.name,
+                    "arguments": call.arguments,
+                    "result": result.content,
+                    "is_error": result.is_error,
+                }
+            )
             follow_up_messages.append(
                 MessageIn(
                     role="user",

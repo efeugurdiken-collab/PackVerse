@@ -101,25 +101,42 @@ worker availability alongside database connectivity. Still no scheduled/
 cron jobs, parallel workflow steps, DAG branching, WebSocket/streaming
 progress, human-approval steps, or a Kubernetes-style orchestrator.
 
-**Sprint P9 scope (in progress - MCP Integration, delivered in
-independently-verified phases):** phase 1 (P9A) added optional
-tool-calling support to the LLM Gateway (`app/llm/`) - a caller may pass
-`tools` on `/api/v1/llm/generate` and get back `tool_calls`, implemented
-for the Anthropic, OpenAI-compatible, and `fake` providers; purely
-additive, no migration. Phase 2 (P9B) added an MCP client (`app/mcp/`) -
-a hand-rolled Streamable HTTP JSON-RPC client (`initialize` handshake,
+**Sprint P9 scope (MCP Integration, delivered in independently-verified
+phases):** phase 1 (P9A) added optional tool-calling support to the LLM
+Gateway (`app/llm/`) - a caller may pass `tools` on
+`/api/v1/llm/generate` and get back `tool_calls`, implemented for the
+Anthropic, OpenAI-compatible, and `fake` providers; purely additive, no
+migration. Phase 2 (P9B) added an MCP client (`app/mcp/`) - a
+hand-rolled Streamable HTTP JSON-RPC client (`initialize` handshake,
 `tools/list`, `tools/call`; no SSE/streaming, no stdio transport, tools
 only, no persistent session across calls) plus read-only
 `/api/v1/mcp/{servers,servers/{name}/tools}` endpoints, with servers
 configured via `MCP_SERVERS_JSON` (no server-registration API - same
-"configured, not managed via API" posture as `AgentDefinition`). Still
-no runtime integration: `app/runtime/executor.py` does not yet call the
-MCP client, and `AgentDefinition.configuration_json` has no tool/MCP
-declaration convention yet - a caller can list a server's tools over the
-API, but nothing in an agent run actually invokes one yet. That wiring
-(a bounded tool-execution loop in the AI Runtime, plus persisting a
-tool-call trace) is the remaining phase before Sprint P9 as a whole is
-complete.
+"configured, not managed via API" posture as `AgentDefinition`). Phase 3
+(P9C1) wired the two together: `app/runtime/executor.py`'s single LLM
+call becomes a bounded LLM<->MCP loop whenever an agent's
+`configuration_json` names an `mcp_server` - call the LLM with tools
+attached, execute any `tool_calls` via the P9B client, feed results back
+as a synthesized `user`-role follow-up message (not a provider's native
+tool-result shape - `MessageRole` still has no `"tool"` role), re-call,
+up to `RUNTIME_MAX_TOOL_ITERATIONS`; an agent with no `mcp_server`
+configured is byte-for-byte unaffected. Phase 4 (P9C2) added persistence
+on top of that loop: a new `tool_calls_json` column on `agent_runs`
+records `{iteration, llm_request_id, tool_name, arguments, result,
+is_error}` for every tool call a run made, exposed via
+`AgentRunRead.tool_calls_json`; `input_tokens`/`output_tokens`/
+`total_tokens`/`estimated_cost_usd` became the **sum** across every LLM
+call a run's loop made (previously, and still for any run that made
+exactly one call - i.e. every agent with no `mcp_server` configured,
+still the common case - this is identical to mirroring the one
+corresponding `llm_requests` row); `estimated_cost_usd` is
+"sticky-`None`" - if any call's own cost is unknown, the run's aggregate
+is `None` too, never a fabricated partial total. Both the trace and the
+aggregated usage are persisted even on a `FAILED` run, for whatever
+iterations/tool calls completed before the failure. Still no parallel
+tool-call execution, no per-agent tool allowlisting within a server, no
+streaming of intermediate tool-call progress, and no `AgentDefinition`/
+MCP-server CRUD API.
 
 > P1-P6 were all written in a sandboxed environment with no Docker and
 > no external network access, then verified locally by the maintainer.
@@ -171,12 +188,14 @@ packverse-platform/
 │   │   ├── llm/               # LLM Gateway: base.py (interface), providers/ (anthropic, openai_compatible, fake),
 │   │   │                      #   gateway.py, routing.py, pricing.py, factory.py, models.py, exceptions.py
 │   │   ├── runtime/          # AI Runtime: exceptions.py, models.py (state machine), prompt_builder.py,
-│   │   │                      #   service.py (create/get/list/cancel), executor.py (execute_run)
+│   │   │                      #   service.py (create/get/list/cancel), executor.py (execute_run - a
+│   │   │                      #   bounded LLM<->MCP tool-call loop when configuration_json names an
+│   │   │                      #   mcp_server, Sprint P9C1/P9C2 - see Sprint P9 scope above)
 │   │   ├── agents/          # Autonomous multi-step agent loops (empty - out of scope through P7)
 │   │   ├── mcp/              # MCP client (Sprint P9B): models.py, exceptions.py, client.py
 │   │   │                      #   (Streamable HTTP JSON-RPC: initialize/tools-list/tools-call),
-│   │   │                      #   factory.py (MCP_SERVERS_JSON -> MCPClient) - not yet wired into
-│   │   │                      #   app/runtime/ (see Sprint P9 scope above)
+│   │   │                      #   factory.py (MCP_SERVERS_JSON -> MCPClient) - called from
+│   │   │                      #   app/runtime/executor.py's tool-call loop (Sprint P9C1)
 │   │   ├── workflows/       # Workflow Orchestration: exceptions.py, models.py (state machines),
 │   │   │                      #   definition.py (steps parsing/validation), input_builder.py,
 │   │   │                      #   service.py (create/get/list/cancel/steps), executor.py (execute_workflow_run)
@@ -251,9 +270,7 @@ nothing until you list a real server there. To exercise it, set
 `MCP_SERVERS_JSON` to a JSON array of `{"name", "base_url", "auth_token"}`
 objects (`auth_token` optional) pointing at a real MCP server reachable
 over Streamable HTTP - see `app/mcp/client.py`'s module docstring for
-this sprint's transport/protocol scope. Nothing in the AI Runtime calls
-this client yet (see Sprint P9 scope above) - `POST /runs` cannot invoke
-an MCP tool as of this sprint.
+this sprint's transport/protocol scope.
 
 The AI Runtime (`POST /api/v1/runs`) needs no configuration of its own -
 it reuses the LLM Gateway settings above (an `AgentDefinition`'s
@@ -261,7 +278,15 @@ it reuses the LLM Gateway settings above (an `AgentDefinition`'s
 Run API section below). There is no `AgentDefinition` CRUD API yet -
 definitions are inserted directly (seeded from the vault's
 `05 Agents/` specifications, per Sprint P2's design), so exercising
-`POST /runs` requires an `agent_definitions` row to already exist.
+`POST /runs` requires an `agent_definitions` row to already exist. To
+give an agent access to MCP tools (Sprint P9C1/P9C2), add an
+`"mcp_server"` key to its `configuration_json` naming one of the
+`MCP_SERVERS_JSON` entries above - `app/runtime/executor.py` then offers
+that server's tools on every call the run's bounded tool-call loop
+makes, up to `RUNTIME_MAX_TOOL_ITERATIONS`, and persists the resulting
+trace/aggregated usage on the `AgentRun` row (see Sprint P9 scope
+above). An agent with no `mcp_server` key behaves exactly as before this
+sprint.
 
 ### 2. Start the stack
 
@@ -855,6 +880,7 @@ Test files:
 | `tests/test_runtime_prompt_builder.py` | `build_generate_request`: required-config enforcement (`system_prompt`/`model`), optional provider/temperature/max_tokens forwarding, context rendering into the prompt, agent id/name in `metadata` |
 | `tests/test_runtime_service.py` | `create_run`/`get_run`/`list_runs`/`cancel_run`: agent existence/active-status checks, ownership scoping (owner/non-owner/admin), pagination, cancel from `queued` and `running` (including duration computation), illegal-transition rejection from every terminal state |
 | `tests/test_runtime_executor.py` | `execute_run`: successful execution (status/output/tokens/cost/`llm_request_id` linkage to the P5 audit trail), gateway failure/timeout (run marked `failed` and re-raised), misconfigured agent, executing a non-`queued` run, context reaching the provider through the prompt |
+| `tests/test_runtime_tool_loop.py` | `execute_run`'s bounded LLM<->MCP tool-call loop (Sprint P9C1/P9C2, `httpx_mock`-mocked `MCPClient` calls): no-`mcp_server` regression (byte-for-byte unchanged), a full tool-call round trip (trace shape, aggregated tokens/cost, cost-specific aggregation with pricing configured), the tool result reaching the next LLM call, the iteration cap failing cleanly (never hangs), an MCP failure mid-batch persisting only the tool calls that actually completed, a provider error after one successful tool call, an unconfigured `mcp_server`, and the defensive "`tool_calls` with no tools offered" case - every failure-path test confirms partial trace/usage survives the failure |
 | `tests/test_runtime_api.py` | `/api/v1/runs/*`: auth/role matrix on `POST /runs` (Sprint P8: now asserts `202`/`queued`), enqueue-time error mapping (404/409; a misconfigured-but-active agent now still enqueues, `202`), retrieval (owner/non-owner-404/admin-any, never `user_input`/`context`), list pagination/ownership scoping, cancel (401/403/404, queued-cancel-succeeds-200, already-cancelled-409) |
 | `tests/test_workflow_models.py` | `WorkflowRun`/`WorkflowStepRun` state machines (`app.workflows.models`): every valid transition for both, illegal transitions, every terminal state accepts no further transitions, raised exceptions carry current/target |
 | `tests/test_workflow_definition.py` | `parse_workflow_steps`: valid ordered/out-of-order workflows, default mapping resolution, explicit `step_output`/`static`/`workflow_input` mappings, empty/missing/non-list steps, duplicate step ids/order, missing/malformed agent id, malformed step shape, forward-reference/self-reference/missing-step_id `step_output` rejection, unsupported mapping source, non-object `input_mapping`, `previous_output` on the first step |
@@ -923,9 +949,10 @@ and prints `ALL CHECKS PASSED` only on a genuine clean run:
 6. AI Runtime - **P6, built, statically validated (`py_compile`), awaiting CTO local verification**
 7. Workflow Orchestration - **P7, built, statically validated (`py_compile`), awaiting CTO local verification**
 8. Asynchronous Job Execution - **P8, built, statically validated (`py_compile`), awaiting CTO local verification**
-9. MCP Integration - **P9, in progress: P9A (LLM Gateway tool-calling) and
-   P9B (MCP client, `app/mcp/`) landed; runtime integration (tool-execution
-   loop in `app/runtime/executor.py`) not yet built**
+9. MCP Integration - **P9, built (P9A: LLM Gateway tool-calling; P9B: MCP
+   client, `app/mcp/`; P9C1: bounded tool-call loop in
+   `app/runtime/executor.py`; P9C2: trace persistence + usage aggregation),
+   awaiting CTO local verification**
 10. RAG
 11. Product Factory
 12. Marketplace Automation

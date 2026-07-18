@@ -26,6 +26,7 @@ P5_REVISION = "7c19e4b8a2d6"
 P6_REVISION = "a1c8f7d2b3e9"
 P7_REVISION = "d4e6b9a3f1c7"
 P8_REVISION = "b7f3e9a1c5d2"  # head as of Sprint P8
+P9C2_REVISION = "d657afc740be"  # head as of Sprint P9C2
 
 EXPECTED_TABLES = {
     "products",
@@ -112,6 +113,7 @@ def test_migration_revision_identifiers_match_expected() -> None:
         P6_REVISION,
         P7_REVISION,
         P8_REVISION,
+        P9C2_REVISION,
     ):
         matches = list(versions_dir.glob(f"{revision}_*.py"))
         assert len(matches) == 1, f"expected exactly one migration file for {revision}"
@@ -338,15 +340,13 @@ def test_migration_downgrade_to_p7_removes_only_p8_additions(
         command.downgrade(cfg, "base")
 
 
-def test_migration_downgrade_one_step_from_head_removes_only_p8_additions(
+def test_migration_downgrade_one_step_from_head_removes_only_p9c2_additions(
     test_sync_database_url: str,
 ) -> None:
-    """`alembic downgrade -1` from head (P8) must remove exactly Sprint
-    P8's own additions (the worker_heartbeats table, and the nine
-    columns it added to `jobs`) and nothing else - every P1-P7 table,
-    including P7's workflow_runs/workflow_step_runs, P6's agent_runs,
-    P5's llm_requests, and P4's asset storage columns, must survive
-    untouched."""
+    """`alembic downgrade -1` from the true current head (P9C2) must
+    remove exactly tool_calls_json from agent_runs and nothing else -
+    every other agent_runs column, and every P1-P8 table including
+    worker_heartbeats and the P8 jobs columns, must survive untouched."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -355,24 +355,27 @@ def test_migration_downgrade_one_step_from_head_removes_only_p8_additions(
         engine = sa.create_engine(test_sync_database_url)
         inspector = sa.inspect(engine)
         table_names = set(inspector.get_table_names())
+        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
         jobs_columns = {col["name"] for col in inspector.get_columns("jobs")}
-        asset_columns = {col["name"] for col in inspector.get_columns("assets")}
         engine.dispose()
 
-        assert "worker_heartbeats" not in table_names
-        assert "workflow_runs" in table_names
-        assert "workflow_step_runs" in table_names
-        assert "agent_runs" in table_names
-        assert "llm_requests" in table_names
-        assert EXPECTED_TABLES - {"worker_heartbeats"} <= table_names
-        assert P8_JOBS_COLUMNS.isdisjoint(jobs_columns)
-
-        p4_columns = {
-            "original_filename", "content_type", "etag", "storage_backend",
-            "status", "uploaded_by_user_id", "deleted_at",
+        assert "tool_calls_json" not in agent_run_columns
+        other_agent_run_columns = {
+            "id", "agent_id", "created_by_user_id", "status", "llm_request_id",
+            "provider", "model", "input_tokens", "output_tokens", "total_tokens",
+            "estimated_cost_usd", "output_text", "error_code", "error_message",
+            "duration_ms", "started_at", "completed_at", "created_at", "updated_at",
         }
-        assert p4_columns <= asset_columns
+        assert other_agent_run_columns <= agent_run_columns
+        assert "worker_heartbeats" in table_names
+        assert P8_JOBS_COLUMNS <= jobs_columns
+        assert EXPECTED_TABLES <= table_names
 
         command.upgrade(cfg, "head")
+        engine = sa.create_engine(test_sync_database_url)
+        inspector = sa.inspect(engine)
+        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
+        engine.dispose()
+        assert "tool_calls_json" in agent_run_columns
     finally:
         command.downgrade(cfg, "base")
