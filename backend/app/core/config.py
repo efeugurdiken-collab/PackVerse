@@ -165,6 +165,16 @@ class Settings(BaseSettings):
     # job_lease_seconds above.
     worker_heartbeat_stale_after_seconds: float = 60.0
 
+    # --- MCP client (Sprint P9B) ---
+    # JSON array: [{"name": "...", "base_url": "...", "auth_token": "..."}, ...]
+    # ("auth_token" optional). Empty by default - the app boots fine with
+    # zero MCP servers configured, the same "no config needed to boot"
+    # posture as the LLM Gateway. Read-only server/tool discovery only
+    # this sprint - see app/api/v1/mcp.py; there is no server-
+    # registration API, servers are configured here directly.
+    mcp_servers_json: str = "[]"
+    mcp_timeout_seconds: float = 10.0
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:
@@ -285,6 +295,46 @@ class Settings(BaseSettings):
             str(key): {str(k): str(v) for k, v in entry.items()}
             for key, entry in parsed.items()
         }
+
+    @field_validator("mcp_servers_json")
+    @classmethod
+    def validate_mcp_servers_json(cls, v: str) -> str:
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"mcp_servers_json must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("mcp_servers_json must be a JSON array")
+        seen_names: set[object] = set()
+        for entry in parsed:
+            if not isinstance(entry, dict) or "name" not in entry or "base_url" not in entry:
+                raise ValueError(
+                    "mcp_servers_json entries must be objects with at least "
+                    "'name' and 'base_url'"
+                )
+            if entry["name"] in seen_names:
+                raise ValueError(
+                    f"mcp_servers_json has a duplicate server name: {entry['name']!r}"
+                )
+            seen_names.add(entry["name"])
+        return v
+
+    @property
+    def mcp_servers_list(self) -> list[dict[str, str | None]]:
+        """[{"name": ..., "base_url": ..., "auth_token": ... | None}, ...] -
+        validated as well-formed JSON at startup (validate_mcp_servers_json).
+        Reparsed here rather than cached, the same rationale as
+        llm_model_aliases_map/llm_pricing_map: this blob is tiny.
+        app/mcp/factory.py turns each entry into an MCPServerConfig."""
+        parsed = json.loads(self.mcp_servers_json)
+        return [
+            {
+                "name": str(entry["name"]),
+                "base_url": str(entry["base_url"]),
+                "auth_token": str(entry["auth_token"]) if entry.get("auth_token") else None,
+            }
+            for entry in parsed
+        ]
 
     @model_validator(mode="after")
     def resolve_jwt_secret_key(self) -> "Settings":

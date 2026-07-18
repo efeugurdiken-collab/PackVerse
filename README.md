@@ -101,6 +101,26 @@ worker availability alongside database connectivity. Still no scheduled/
 cron jobs, parallel workflow steps, DAG branching, WebSocket/streaming
 progress, human-approval steps, or a Kubernetes-style orchestrator.
 
+**Sprint P9 scope (in progress - MCP Integration, delivered in
+independently-verified phases):** phase 1 (P9A) added optional
+tool-calling support to the LLM Gateway (`app/llm/`) - a caller may pass
+`tools` on `/api/v1/llm/generate` and get back `tool_calls`, implemented
+for the Anthropic, OpenAI-compatible, and `fake` providers; purely
+additive, no migration. Phase 2 (P9B) added an MCP client (`app/mcp/`) -
+a hand-rolled Streamable HTTP JSON-RPC client (`initialize` handshake,
+`tools/list`, `tools/call`; no SSE/streaming, no stdio transport, tools
+only, no persistent session across calls) plus read-only
+`/api/v1/mcp/{servers,servers/{name}/tools}` endpoints, with servers
+configured via `MCP_SERVERS_JSON` (no server-registration API - same
+"configured, not managed via API" posture as `AgentDefinition`). Still
+no runtime integration: `app/runtime/executor.py` does not yet call the
+MCP client, and `AgentDefinition.configuration_json` has no tool/MCP
+declaration convention yet - a caller can list a server's tools over the
+API, but nothing in an agent run actually invokes one yet. That wiring
+(a bounded tool-execution loop in the AI Runtime, plus persisting a
+tool-call trace) is the remaining phase before Sprint P9 as a whole is
+complete.
+
 > P1-P6 were all written in a sandboxed environment with no Docker and
 > no external network access, then verified locally by the maintainer.
 > P1/P2: pytest (20 passed), ruff, mypy all passed. P3: 58 passed, mypy
@@ -153,6 +173,10 @@ packverse-platform/
 │   │   ├── runtime/          # AI Runtime: exceptions.py, models.py (state machine), prompt_builder.py,
 │   │   │                      #   service.py (create/get/list/cancel), executor.py (execute_run)
 │   │   ├── agents/          # Autonomous multi-step agent loops (empty - out of scope through P7)
+│   │   ├── mcp/              # MCP client (Sprint P9B): models.py, exceptions.py, client.py
+│   │   │                      #   (Streamable HTTP JSON-RPC: initialize/tools-list/tools-call),
+│   │   │                      #   factory.py (MCP_SERVERS_JSON -> MCPClient) - not yet wired into
+│   │   │                      #   app/runtime/ (see Sprint P9 scope above)
 │   │   ├── workflows/       # Workflow Orchestration: exceptions.py, models.py (state machines),
 │   │   │                      #   definition.py (steps parsing/validation), input_builder.py,
 │   │   │                      #   service.py (create/get/list/cancel/steps), executor.py (execute_workflow_run)
@@ -164,7 +188,7 @@ packverse-platform/
 │   │   │                      #   (`python -m app.worker` entrypoint), healthcheck.py (Docker HEALTHCHECK)
 │   │   └── main.py         # FastAPI app entrypoint
 │   ├── tests/                # model, API, auth, authorization, storage, asset, LLM gateway, AI runtime,
-│   │                          #   workflow orchestration, job queue, worker, migration, and health tests
+│   │                          #   workflow orchestration, job queue, worker, MCP client, migration, and health tests
 │   ├── alembic/
 │   │   └── versions/
 │   │       ├── 06b17a0f30ad_create_domain_tables.py   # P2 schema baseline
@@ -219,6 +243,17 @@ without any real API key, set `LLM_DEFAULT_PROVIDER=fake` (or pass
 network call. To use a real provider, set `ANTHROPIC_API_KEY` and/or
 `OPENAI_API_KEY` (plus `OPENAI_BASE_URL` if pointing at an
 OpenAI-compatible server other than OpenAI itself) in `.env.example`.
+
+The MCP client (`GET /api/v1/mcp/servers`, `GET
+/api/v1/mcp/servers/{name}/tools`) also needs no configuration to boot -
+`MCP_SERVERS_JSON` defaults to `[]`, so both endpoints simply return
+nothing until you list a real server there. To exercise it, set
+`MCP_SERVERS_JSON` to a JSON array of `{"name", "base_url", "auth_token"}`
+objects (`auth_token` optional) pointing at a real MCP server reachable
+over Streamable HTTP - see `app/mcp/client.py`'s module docstring for
+this sprint's transport/protocol scope. Nothing in the AI Runtime calls
+this client yet (see Sprint P9 scope above) - `POST /runs` cannot invoke
+an MCP tool as of this sprint.
 
 The AI Runtime (`POST /api/v1/runs`) needs no configuration of its own -
 it reuses the LLM Gateway settings above (an `AgentDefinition`'s
@@ -813,6 +848,8 @@ Test files:
 | `tests/test_llm_anthropic_adapter.py` | `AnthropicProvider` against `httpx_mock`: request mapping (headers, system/messages split, no API key in body), response/usage mapping, timeout/connection/rate-limit/auth/5xx error mapping, unexpected-response-shape handling, health check |
 | `tests/test_llm_openai_adapter.py` | `OpenAICompatibleProvider` against `httpx_mock`: request mapping (auth header, org/project headers), structured-output request format, response/usage mapping, error mapping, health check |
 | `tests/test_llm_structured_output.py` | Gateway-level JSON Schema validation: valid passthrough, malformed JSON, schema-violation, no-`response_format`-skips-validation, `raw_text` never leaks into the exception's own message, unsupported structured-output mode |
+| `tests/test_mcp_client.py` | `MCPClient` against `httpx_mock`: `initialize`/`notifications/initialized`/`tools/list`/`tools/call` handshake sequencing, tool/result parsing, JSON-RPC-level errors (`tools/call` failure -> `MCPToolCallError`, malformed responses -> `MCPProtocolError`), transport-level errors (timeout, connection refused, non-200, non-JSON body), auth token sent as a bearer header and never leaked into an exception message |
+| `tests/test_mcp_api.py` | MCP client API: `/mcp/servers` and `/mcp/servers/{name}/tools` authentication/role matrix, empty-by-default server list, unknown server -> 404, unreachable server -> 502 (via a mocked `MCPClient` HTTP call) |
 | `tests/test_llm_api.py` | `/api/v1/llm/*`: auth/role matrix on `/generate`, error-code mapping (429/504/503/422), `/providers`, `/models`, `/health`, `/requests/{id}` (owner, unknown-404, non-owner-404, admin-any), persistence (success/failure/tokens/latency/cost, never the prompt or content) |
 | `tests/test_runtime_models.py` | `AgentRun` state machine (`app.runtime.models.validate_transition`): every valid transition, illegal transitions (queued->completed/failed, any transition out of a terminal state), the raised exception carries current/target |
 | `tests/test_runtime_prompt_builder.py` | `build_generate_request`: required-config enforcement (`system_prompt`/`model`), optional provider/temperature/max_tokens forwarding, context rendering into the prompt, agent id/name in `metadata` |
@@ -886,7 +923,9 @@ and prints `ALL CHECKS PASSED` only on a genuine clean run:
 6. AI Runtime - **P6, built, statically validated (`py_compile`), awaiting CTO local verification**
 7. Workflow Orchestration - **P7, built, statically validated (`py_compile`), awaiting CTO local verification**
 8. Asynchronous Job Execution - **P8, built, statically validated (`py_compile`), awaiting CTO local verification**
-9. MCP Integration
+9. MCP Integration - **P9, in progress: P9A (LLM Gateway tool-calling) and
+   P9B (MCP client, `app/mcp/`) landed; runtime integration (tool-execution
+   loop in `app/runtime/executor.py`) not yet built**
 10. RAG
 11. Product Factory
 12. Marketplace Automation
