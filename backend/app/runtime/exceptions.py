@@ -58,6 +58,22 @@ class AgentRunNotFoundError(RuntimeDomainError):
         self.run_id = run_id
 
 
+class ToolLoopLimitExceededError(RuntimeDomainError):
+    """Raised by app/runtime/executor.py's _run_tool_loop (Sprint P9C1)
+    when the model still wants to call a tool after
+    settings.runtime_max_tool_iterations LLM calls - a safety bound
+    against a runaway tool-use loop. Always means the configured cap
+    was hit, never a signal that tool-calling itself is broken."""
+
+    def __init__(self, agent_id: object, max_iterations: int) -> None:
+        super().__init__(
+            f"Agent {agent_id} exceeded the tool-call iteration limit "
+            f"({max_iterations} LLM calls) without a final answer"
+        )
+        self.agent_id = agent_id
+        self.max_iterations = max_iterations
+
+
 class InvalidRunTransitionError(RuntimeDomainError):
     """Raised whenever code attempts a status change not present in
     app/runtime/models.py's transition table - e.g. cancelling a run

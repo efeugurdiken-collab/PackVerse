@@ -175,6 +175,14 @@ class Settings(BaseSettings):
     mcp_servers_json: str = "[]"
     mcp_timeout_seconds: float = 10.0
 
+    # --- Runtime tool loop (Sprint P9C1) ---
+    # Maximum number of LLM Gateway calls a single agent run's tool-use
+    # loop may make (app/runtime/executor.py's _run_tool_loop) before
+    # failing with ToolLoopLimitExceededError instead of continuing
+    # indefinitely. An agent with no mcp_server configured always makes
+    # exactly one call, regardless of this setting.
+    runtime_max_tool_iterations: int = 5
+
     @field_validator("environment")
     @classmethod
     def validate_environment(cls, v: str) -> str:
@@ -335,6 +343,13 @@ class Settings(BaseSettings):
             }
             for entry in parsed
         ]
+
+    @field_validator("runtime_max_tool_iterations")
+    @classmethod
+    def validate_runtime_max_tool_iterations(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("runtime_max_tool_iterations must be at least 1")
+        return v
 
     @model_validator(mode="after")
     def resolve_jwt_secret_key(self) -> "Settings":
