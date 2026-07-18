@@ -36,7 +36,7 @@ def compute_backoff_seconds(attempt_count: int, *, base_seconds: float) -> float
     """Exponential backoff: attempt N waits base_seconds * 2^(N-1) -
     mirrors app/llm/gateway.py's own retry backoff shape, one layer up
     (whole-job re-attempts rather than individual provider calls)."""
-    return base_seconds * (2 ** max(attempt_count - 1, 0))
+    return base_seconds * float(2 ** max(attempt_count - 1, 0))
 
 
 async def claim_next_job(
