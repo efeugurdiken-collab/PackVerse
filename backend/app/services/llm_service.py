@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.llm.exceptions import LLMError, LLMStructuredOutputError
 from app.llm.gateway import LLMGateway
-from app.llm.models import LLMRequest, Message, ResponseFormat
+from app.llm.models import LLMRequest, Message, ResponseFormat, ToolCall, ToolDefinition
 from app.llm.routing import default_model_for, resolve_model, resolve_provider_name
 from app.models.enums import LLMRequestStatus, UserRole
 from app.models.llm_request import LLMRequestRecord
@@ -30,6 +30,8 @@ from app.schemas.llm import (
     ProviderHealthInfo,
     ProviderInfo,
     ResponseFormatIn,
+    ToolCallOut,
+    ToolDefinitionIn,
 )
 from app.services.exceptions import LLMRequestNotFoundError
 
@@ -40,6 +42,21 @@ def _to_response_format(data: ResponseFormatIn | None) -> ResponseFormat | None:
     if data.mode != "json_schema":
         raise LLMStructuredOutputError(f"Unsupported structured output mode: {data.mode!r}")
     return ResponseFormat(json_schema=data.json_schema, name=data.name)
+
+
+def _to_tools(data: list[ToolDefinitionIn] | None) -> tuple[ToolDefinition, ...] | None:
+    if not data:
+        return None
+    return tuple(
+        ToolDefinition(name=t.name, description=t.description, input_schema=t.input_schema)
+        for t in data
+    )
+
+
+def _tool_calls_to_schema(tool_calls: tuple[ToolCall, ...] | None) -> list[ToolCallOut] | None:
+    if not tool_calls:
+        return None
+    return [ToolCallOut(id=c.id, name=c.name, arguments=c.arguments) for c in tool_calls]
 
 
 async def generate_and_persist(
@@ -91,6 +108,7 @@ async def generate_and_persist(
         temperature=payload.temperature,
         max_tokens=max_tokens,
         response_format=response_format,
+        tools=_to_tools(payload.tools),
         metadata=payload.metadata,
     )
 
@@ -141,6 +159,7 @@ async def generate_and_persist(
         latency_ms=response.latency_ms,
         created_at=response.created_at,
         provider_request_id=response.provider_request_id,
+        tool_calls=_tool_calls_to_schema(response.tool_calls),
         metadata=response.metadata,
     )
 

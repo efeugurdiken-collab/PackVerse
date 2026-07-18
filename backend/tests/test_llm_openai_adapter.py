@@ -20,7 +20,7 @@ from app.llm.exceptions import (
     LLMResponseError,
     LLMTimeoutError,
 )
-from app.llm.models import LLMRequest, Message, ResponseFormat
+from app.llm.models import LLMRequest, Message, ResponseFormat, ToolDefinition
 from app.llm.providers.openai_compatible import OpenAICompatibleProvider
 
 BASE_URL = "https://api.openai.test/v1"
@@ -99,6 +99,38 @@ async def test_structured_output_request_includes_response_format(httpx_mock) ->
     assert body["response_format"]["json_schema"]["name"] == "answer"
 
 
+async def test_request_without_tools_omits_tools_key(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+
+    await _provider().generate(_request())
+
+    body = json.loads(httpx_mock.get_requests()[0].content)
+    assert "tools" not in body
+
+
+async def test_request_mapping_includes_tools_when_set(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+    tool = ToolDefinition(
+        name="get_weather",
+        description="Look up the current weather for a city",
+        input_schema={"type": "object", "properties": {"city": {"type": "string"}}},
+    )
+
+    await _provider().generate(_request(tools=(tool,)))
+
+    body = json.loads(httpx_mock.get_requests()[0].content)
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Look up the current weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }
+    ]
+
+
 # --- Response / usage mapping ----------------------------------------------
 
 
@@ -111,6 +143,53 @@ async def test_response_mapping(httpx_mock) -> None:
     assert response.finish_reason == "stop"
     assert response.provider == "openai"
     assert response.provider_request_id == "chatcmpl-123"
+
+
+async def test_response_mapping_parses_tool_calls(httpx_mock) -> None:
+    httpx_mock.add_response(
+        json={
+            "id": "chatcmpl-tool",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city": "nyc"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+    )
+
+    response = await _provider().generate(_request())
+
+    assert response.finish_reason == "tool_calls"
+    assert response.content == ""
+    assert response.tool_calls is not None
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.id == "call_1"
+    assert call.name == "get_weather"
+    assert call.arguments == {"city": "nyc"}
+
+
+async def test_response_without_tool_calls_has_none(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+
+    response = await _provider().generate(_request())
+
+    assert response.tool_calls is None
 
 
 async def test_usage_mapping(httpx_mock) -> None:

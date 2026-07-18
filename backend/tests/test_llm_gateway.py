@@ -26,7 +26,7 @@ from app.llm.exceptions import (
     LLMTimeoutError,
 )
 from app.llm.gateway import LLMGateway
-from app.llm.models import LLMRequest, Message, ResponseFormat
+from app.llm.models import LLMRequest, Message, ResponseFormat, ToolCall, ToolDefinition
 from app.llm.providers.fake import FakeProvider
 
 
@@ -39,6 +39,7 @@ def _request(
     provider: str | None = None,
     model: str = "m1",
     response_format: ResponseFormat | None = None,
+    tools: tuple[ToolDefinition, ...] | None = None,
 ) -> LLMRequest:
     return LLMRequest(
         request_id=str(uuid.uuid4()),
@@ -46,6 +47,7 @@ def _request(
         messages=(Message(role="user", content="hi"),),
         provider=provider,
         response_format=response_format,
+        tools=tools,
     )
 
 
@@ -105,6 +107,48 @@ async def test_model_that_is_not_a_known_alias_passes_through_unchanged() -> Non
     response = await gateway.generate(_request(provider="fake", model="literal-model-name"))
 
     assert response.model == "literal-model-name"
+
+
+# --- Tool calling (Sprint P9A) ------------------------------------------
+
+
+async def test_request_tools_pass_through_to_provider() -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingProvider(FakeProvider):
+        async def generate(self, request: LLMRequest):  # type: ignore[override]
+            captured["tools"] = request.tools
+            return await super().generate(request)
+
+    settings = _settings(llm_allowed_providers="fake")
+    gateway = LLMGateway({"fake": CapturingProvider()}, settings)
+    tool = ToolDefinition(
+        name="get_weather", description="looks up weather", input_schema={"type": "object"}
+    )
+
+    await gateway.generate(_request(provider="fake", tools=(tool,)))
+
+    assert captured["tools"] == (tool,)
+
+
+async def test_response_tool_calls_pass_through_unchanged() -> None:
+    settings = _settings(llm_allowed_providers="fake")
+    tool_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "nyc"})
+    gateway = LLMGateway({"fake": FakeProvider(tool_calls=(tool_call,))}, settings)
+
+    response = await gateway.generate(_request(provider="fake"))
+
+    assert response.tool_calls == (tool_call,)
+    assert response.finish_reason == "tool_use"
+
+
+async def test_response_without_tool_calls_leaves_field_none() -> None:
+    settings = _settings(llm_allowed_providers="fake")
+    gateway = LLMGateway({"fake": FakeProvider()}, settings)
+
+    response = await gateway.generate(_request(provider="fake"))
+
+    assert response.tool_calls is None
 
 
 # --- Retry policy -------------------------------------------------------

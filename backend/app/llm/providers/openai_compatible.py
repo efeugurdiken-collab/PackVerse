@@ -8,6 +8,7 @@ OPENAI_* settings and app/llm/factory.py).
 """
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ import httpx
 
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMProviderUnavailable, LLMResponseError, LLMTimeoutError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk
+from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
 from app.llm.providers._shared import map_http_error
 
 
@@ -72,6 +73,18 @@ class OpenAICompatibleProvider(LLMProvider):
                     "strict": True,
                 },
             }
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+                for tool in request.tools
+            ]
         return payload
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -103,6 +116,19 @@ class OpenAICompatibleProvider(LLMProvider):
             input_tokens = int(usage.get("prompt_tokens", 0))
             output_tokens = int(usage.get("completion_tokens", 0))
             provider_request_id = body.get("id")
+            raw_tool_calls = choice["message"].get("tool_calls")
+            tool_calls = (
+                tuple(
+                    ToolCall(
+                        id=str(call["id"]),
+                        name=str(call["function"]["name"]),
+                        arguments=json.loads(call["function"]["arguments"] or "{}"),
+                    )
+                    for call in raw_tool_calls
+                )
+                if raw_tool_calls
+                else None
+            )
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMResponseError(self.name, str(exc)) from exc
 
@@ -116,6 +142,7 @@ class OpenAICompatibleProvider(LLMProvider):
             latency_ms=latency_ms,
             created_at=datetime.now(timezone.utc),
             provider_request_id=provider_request_id,
+            tool_calls=tool_calls,
             metadata={},
         )
 

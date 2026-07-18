@@ -18,7 +18,7 @@ from app.llm.exceptions import (
     LLMResponseError,
     LLMTimeoutError,
 )
-from app.llm.models import LLMRequest, Message
+from app.llm.models import LLMRequest, Message, ToolDefinition
 from app.llm.providers.anthropic import AnthropicProvider
 
 BASE_URL = "https://api.anthropic.test"
@@ -28,13 +28,15 @@ def _provider() -> AnthropicProvider:
     return AnthropicProvider(api_key="test-anthropic-key", base_url=BASE_URL, timeout_seconds=5.0)
 
 
-def _request() -> LLMRequest:
-    return LLMRequest(
-        request_id="req-1",
-        model="claude-3-5-haiku-20241022",
-        messages=(Message(role="user", content="hi"),),
-        system_prompt="be nice",
-    )
+def _request(**overrides: object) -> LLMRequest:
+    defaults: dict[str, object] = {
+        "request_id": "req-1",
+        "model": "claude-3-5-haiku-20241022",
+        "messages": (Message(role="user", content="hi"),),
+        "system_prompt": "be nice",
+    }
+    defaults.update(overrides)
+    return LLMRequest(**defaults)  # type: ignore[arg-type]
 
 
 def _success_body(
@@ -74,6 +76,35 @@ async def test_request_mapping_never_includes_api_key_in_body(httpx_mock) -> Non
     assert "test-anthropic-key" not in json.dumps(body)
 
 
+async def test_request_without_tools_omits_tools_key(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+
+    await _provider().generate(_request())
+
+    body = json.loads(httpx_mock.get_requests()[0].content)
+    assert "tools" not in body
+
+
+async def test_request_mapping_includes_tools_when_set(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+    tool = ToolDefinition(
+        name="get_weather",
+        description="Look up the current weather for a city",
+        input_schema={"type": "object", "properties": {"city": {"type": "string"}}},
+    )
+
+    await _provider().generate(_request(tools=(tool,)))
+
+    body = json.loads(httpx_mock.get_requests()[0].content)
+    assert body["tools"] == [
+        {
+            "name": "get_weather",
+            "description": "Look up the current weather for a city",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }
+    ]
+
+
 # --- Response / usage mapping ----------------------------------------------
 
 
@@ -93,6 +124,43 @@ async def test_response_mapping_concatenates_text_blocks(httpx_mock) -> None:
     assert response.finish_reason == "end_turn"
     assert response.provider_request_id == "msg_abc"
     assert response.provider == "anthropic"
+
+
+async def test_response_mapping_parses_tool_use_blocks(httpx_mock) -> None:
+    httpx_mock.add_response(
+        json={
+            "id": "msg_tool",
+            "content": [
+                {"type": "text", "text": "let me check"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "get_weather",
+                    "input": {"city": "nyc"},
+                },
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }
+    )
+
+    response = await _provider().generate(_request())
+
+    assert response.finish_reason == "tool_use"
+    assert response.tool_calls is not None
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call.id == "toolu_1"
+    assert call.name == "get_weather"
+    assert call.arguments == {"city": "nyc"}
+
+
+async def test_response_without_tool_use_blocks_has_no_tool_calls(httpx_mock) -> None:
+    httpx_mock.add_response(json=_success_body())
+
+    response = await _provider().generate(_request())
+
+    assert response.tool_calls is None
 
 
 async def test_usage_mapping(httpx_mock) -> None:

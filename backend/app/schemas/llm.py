@@ -47,6 +47,29 @@ class ResponseFormatIn(BaseModel):
     json_schema: dict[str, object]
 
 
+class ToolDefinitionIn(BaseModel):
+    """A single tool the model may call (Sprint P9A). Serialized into
+    each provider's own wire format by app/llm/providers/*.py - see
+    app/llm/models.py's ToolDefinition, the framework-agnostic
+    counterpart this converts to at the boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    input_schema: dict[str, object]
+
+
+class ToolCallOut(BaseModel):
+    """A single tool invocation the model requested (Sprint P9A).
+    `arguments` is always a parsed dict, even for providers that return
+    it as a JSON string on the wire - see app/llm/models.py's ToolCall."""
+
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -57,6 +80,7 @@ class GenerateRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
     response_format: ResponseFormatIn | None = None
+    tools: list[ToolDefinitionIn] | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
@@ -73,6 +97,7 @@ class GenerateResponse(BaseModel):
     latency_ms: float
     created_at: datetime
     provider_request_id: str | None
+    tool_calls: list[ToolCallOut] | None
     metadata: dict[str, object]
 
 

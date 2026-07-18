@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk
+from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
 
 DEFAULT_MODEL = "fake-v1"
 
@@ -47,6 +47,11 @@ class FakeProvider(LLMProvider):
     fixed string - used by structured-output tests to control exactly
     what "the provider returned" (including deliberately malformed JSON)
     without needing a second fake provider variant.
+
+    `tool_calls`: script a fixed set of tool calls on the returned
+    response (and force `finish_reason` to `"tool_use"`) - used by P9A's
+    tool-calling tests to control exactly what "the model requested"
+    without a network-bound provider.
     """
 
     name = "fake"
@@ -56,9 +61,11 @@ class FakeProvider(LLMProvider):
         *,
         fail_with: LLMError | None = None,
         response_content: str | None = None,
+        tool_calls: tuple[ToolCall, ...] | None = None,
     ) -> None:
         self._fail_with = fail_with
         self._response_content = response_content
+        self._tool_calls = tool_calls
 
     def _content_for(self, request: LLMRequest) -> str:
         if self._response_content is not None:
@@ -80,11 +87,12 @@ class FakeProvider(LLMProvider):
             provider=self.name,
             model=request.model or DEFAULT_MODEL,
             content=content,
-            finish_reason="stop",
+            finish_reason="tool_use" if self._tool_calls else "stop",
             usage=LLMUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             latency_ms=0.0,
             created_at=datetime.now(timezone.utc),
             provider_request_id=f"fake-{request.request_id}",
+            tool_calls=self._tool_calls,
             metadata={},
         )
 

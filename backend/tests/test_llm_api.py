@@ -18,6 +18,7 @@ from app.core.config import Settings, get_settings
 from app.llm.exceptions import LLMRateLimitError, LLMTimeoutError
 from app.llm.factory import get_llm_gateway
 from app.llm.gateway import LLMGateway
+from app.llm.models import ToolCall
 from app.llm.providers.fake import FakeProvider
 from app.main import app
 from app.models.enums import UserRole
@@ -118,6 +119,43 @@ async def test_generate_rejects_unsupported_message_role(
         headers=operator_headers,
     )
     assert response.status_code == 422
+
+
+# --- Generate: tool calling (Sprint P9A) --------------------------------
+
+
+async def test_generate_response_has_null_tool_calls_by_default(
+    client, llm_gateway_override, operator_headers
+) -> None:
+    response = await client.post(f"{BASE}/generate", json=_payload(), headers=operator_headers)
+
+    assert response.status_code == 200
+    assert response.json()["tool_calls"] is None
+
+
+async def test_generate_with_tools_returns_tool_calls(client, operator_headers) -> None:
+    settings = _llm_settings()
+    tool_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "nyc"})
+    _override(settings, FakeProvider(tool_calls=(tool_call,)))
+
+    response = await client.post(
+        f"{BASE}/generate",
+        json=_payload(
+            tools=[
+                {
+                    "name": "get_weather",
+                    "description": "Look up the current weather for a city",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ]
+        ),
+        headers=operator_headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["finish_reason"] == "tool_use"
+    assert body["tool_calls"] == [{"id": "call_1", "name": "get_weather", "arguments": {"city": "nyc"}}]
 
 
 # --- Generate: error mapping -------------------------------------------

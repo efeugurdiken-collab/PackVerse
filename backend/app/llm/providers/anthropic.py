@@ -15,7 +15,7 @@ import httpx
 
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMProviderUnavailable, LLMResponseError, LLMTimeoutError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk
+from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
 from app.llm.providers._shared import map_http_error
 
 _API_VERSION = "2023-06-01"
@@ -74,6 +74,15 @@ class AnthropicProvider(LLMProvider):
                 f"{request.response_format.json_schema}"
             )
             payload["system"] = f"{existing_system}\n\n{schema_hint}".strip()
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in request.tools
+            ]
         return payload
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
@@ -102,6 +111,21 @@ class AnthropicProvider(LLMProvider):
                 block["text"] for block in body["content"] if block.get("type") == "text"
             ]
             content = "".join(text_blocks)
+            tool_use_blocks = [
+                block for block in body["content"] if block.get("type") == "tool_use"
+            ]
+            tool_calls = (
+                tuple(
+                    ToolCall(
+                        id=str(block["id"]),
+                        name=str(block["name"]),
+                        arguments=dict(block.get("input") or {}),
+                    )
+                    for block in tool_use_blocks
+                )
+                if tool_use_blocks
+                else None
+            )
             usage = body["usage"]
             input_tokens = int(usage["input_tokens"])
             output_tokens = int(usage["output_tokens"])
@@ -120,6 +144,7 @@ class AnthropicProvider(LLMProvider):
             latency_ms=latency_ms,
             created_at=datetime.now(timezone.utc),
             provider_request_id=provider_request_id,
+            tool_calls=tool_calls,
             metadata={},
         )
 

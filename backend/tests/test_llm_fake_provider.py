@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from app.llm.exceptions import LLMTimeoutError
-from app.llm.models import LLMRequest, Message
+from app.llm.models import LLMRequest, Message, ToolCall
 from app.llm.providers.fake import FakeProvider
 
 
@@ -95,3 +95,22 @@ async def test_stream_raises_fail_with_immediately() -> None:
     with pytest.raises(LLMTimeoutError):
         async for _ in provider.stream(_request()):
             pass
+
+
+async def test_no_tool_calls_by_default() -> None:
+    provider = FakeProvider()
+
+    response = await provider.generate(_request())
+
+    assert response.tool_calls is None
+    assert response.finish_reason == "stop"
+
+
+async def test_tool_calls_override_are_returned_verbatim() -> None:
+    tool_call = ToolCall(id="call_1", name="get_weather", arguments={"city": "nyc"})
+    provider = FakeProvider(tool_calls=(tool_call,))
+
+    response = await provider.generate(_request())
+
+    assert response.tool_calls == (tool_call,)
+    assert response.finish_reason == "tool_use"

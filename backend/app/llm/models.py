@@ -26,6 +26,32 @@ class Message:
 
 
 @dataclass(frozen=True)
+class ToolDefinition:
+    """A single tool an LLM may call, in provider-agnostic form. Each
+    provider adapter (app/llm/providers/*.py) serializes this into its
+    own wire format (Anthropic's `input_schema`, OpenAI's
+    `function.parameters`, ...) - callers never build a provider-specific
+    tool payload themselves."""
+
+    name: str
+    description: str
+    input_schema: dict[str, object]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """A single tool invocation an LLM requested, normalized the same
+    way LLMResponse itself is - identical shape regardless of which
+    provider actually served the request. `arguments` is always a parsed
+    dict, even for providers (OpenAI) that return it as a JSON string on
+    the wire."""
+
+    id: str
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True)
 class ResponseFormat:
     """Requests structured (JSON) output. `json_schema` is a plain JSON
     Schema document (the draft python-jsonschema understands).
@@ -55,6 +81,7 @@ class LLMRequest:
     max_tokens: int | None = None
     timeout_seconds: float | None = None
     response_format: ResponseFormat | None = None
+    tools: tuple[ToolDefinition, ...] | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -85,6 +112,7 @@ class LLMResponse:
     created_at: datetime
     provider_request_id: str | None = None
     estimated_cost_usd: Decimal | None = None
+    tool_calls: tuple[ToolCall, ...] | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
 
