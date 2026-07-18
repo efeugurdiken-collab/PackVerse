@@ -18,7 +18,7 @@ jobs:
       - name: Create .env from example
         run: |
           cp .env.example .env
-          sed -i '/^LLM_DEFAULT_PROVIDER=/d' .env
+          sed -i '/^[A-Za-z_][A-Za-z0-9_]*=$/d' .env
 
       - name: Start db and backend
         run: docker compose up --build -d db backend
