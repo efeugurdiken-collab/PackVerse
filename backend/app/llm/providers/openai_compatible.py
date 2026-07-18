@@ -17,7 +17,16 @@ import httpx
 
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMProviderUnavailable, LLMResponseError, LLMTimeoutError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
+from app.llm.models import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    ProviderHealth,
+    StreamChunk,
+    ToolCall,
+)
 from app.llm.providers._shared import map_http_error
 
 
@@ -184,3 +193,45 @@ class OpenAICompatibleProvider(LLMProvider):
                 latency_ms=latency_ms,
             )
         return ProviderHealth(provider=self.name, status="reachable", latency_ms=latency_ms)
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        payload: dict[str, object] = {"model": request.model, "input": list(request.input)}
+        timeout = request.timeout_seconds or self._timeout_seconds
+        started = time.monotonic()
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{self._base_url}/embeddings", headers=self._headers(), json=payload
+                )
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError(self.name) from exc
+        except httpx.RequestError as exc:
+            raise LLMProviderUnavailable(self.name, str(exc)) from exc
+
+        latency_ms = (time.monotonic() - started) * 1000
+
+        if response.status_code != 200:
+            raise map_http_error(self.name, request.model, response)
+
+        try:
+            body = response.json()
+            ordered = sorted(body["data"], key=lambda item: item["index"])
+            embeddings = tuple(tuple(float(v) for v in item["embedding"]) for item in ordered)
+            usage = body.get("usage") or {}
+            input_tokens = int(usage.get("prompt_tokens", 0))
+            provider_request_id = body.get("id")
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMResponseError(self.name, str(exc)) from exc
+
+        return EmbeddingResponse(
+            request_id=request.request_id,
+            provider=self.name,
+            model=request.model,
+            embeddings=embeddings,
+            usage=LLMUsage(input_tokens=input_tokens, output_tokens=0),
+            latency_ms=latency_ms,
+            created_at=datetime.now(timezone.utc),
+            provider_request_id=provider_request_id,
+            metadata={},
+        )

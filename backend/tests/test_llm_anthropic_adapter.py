@@ -13,12 +13,13 @@ import pytest
 
 from app.llm.exceptions import (
     LLMAuthenticationError,
+    LLMEmbeddingNotSupported,
     LLMProviderUnavailable,
     LLMRateLimitError,
     LLMResponseError,
     LLMTimeoutError,
 )
-from app.llm.models import LLMRequest, Message, ToolDefinition
+from app.llm.models import EmbeddingRequest, LLMRequest, Message, ToolDefinition
 from app.llm.providers.anthropic import AnthropicProvider
 
 BASE_URL = "https://api.anthropic.test"
@@ -255,3 +256,16 @@ async def test_health_check_unavailable_on_timeout(httpx_mock) -> None:
     health = await _provider().health_check()
 
     assert health.status == "unavailable"
+
+
+# --- Embeddings (Sprint P10A: no embeddings API, raises immediately) ------
+
+
+async def test_embed_raises_not_supported(httpx_mock) -> None:
+    request = EmbeddingRequest(request_id="req-1", model="claude-3-5-haiku-20241022", input=("hi",))
+
+    with pytest.raises(LLMEmbeddingNotSupported):
+        await _provider().embed(request)
+
+    # No HTTP call was ever attempted.
+    assert len(httpx_mock.get_requests()) == 0

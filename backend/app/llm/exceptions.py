@@ -117,6 +117,18 @@ class LLMStructuredOutputError(LLMError):
         self.raw_text = raw_text
 
 
+class LLMEmbeddingNotSupported(LLMError):
+    """Raised immediately (no HTTP call attempted) by a provider with no
+    embeddings API at all - e.g. Anthropic (Sprint P10A). A permanent
+    capability gap, not a transient condition - never retryable, and
+    choosing a different provider is the only fix, not retrying the same
+    request."""
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(f"LLM provider {provider!r} does not support embeddings")
+        self.provider = provider
+
+
 class LLMResponseError(LLMError):
     """The provider returned a 2xx response but its shape didn't match
     what the adapter expected (missing fields, unexpected type, etc.) -

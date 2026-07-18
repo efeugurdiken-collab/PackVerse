@@ -18,12 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.llm.exceptions import LLMError, LLMStructuredOutputError
 from app.llm.gateway import LLMGateway
-from app.llm.models import LLMRequest, Message, ResponseFormat, ToolCall, ToolDefinition
+from app.llm.models import EmbeddingRequest, LLMRequest, Message, ResponseFormat, ToolCall, ToolDefinition
 from app.llm.routing import default_model_for, resolve_model, resolve_provider_name
 from app.models.enums import LLMRequestStatus, UserRole
 from app.models.llm_request import LLMRequestRecord
 from app.models.user import User
 from app.schemas.llm import (
+    EmbedRequest,
+    EmbedResponse,
     GenerateRequest,
     GenerateResponse,
     ModelAliasInfo,
@@ -160,6 +162,101 @@ async def generate_and_persist(
         created_at=response.created_at,
         provider_request_id=response.provider_request_id,
         tool_calls=_tool_calls_to_schema(response.tool_calls),
+        metadata=response.metadata,
+    )
+
+
+async def embed_and_persist(
+    db: AsyncSession,
+    gateway: LLMGateway,
+    settings: Settings,
+    *,
+    payload: EmbedRequest,
+    user_id: uuid.UUID,
+) -> EmbedResponse:
+    """Sprint P10A. Mirrors generate_and_persist's shape exactly: persist
+    a PENDING row before the provider call, update to SUCCEEDED/FAILED
+    after. Reuses LLMRequestRecord's existing columns as-is - no new
+    column, no migration: output_tokens is always 0 and total_tokens
+    equals input_tokens, since an embedding call has no "output" in the
+    generate() sense. Never stores payload.input anywhere - same
+    no-content-persistence guarantee as generate_and_persist.
+    """
+    request_id = str(uuid.uuid4())
+    normalized_input = (
+        (payload.input,) if isinstance(payload.input, str) else tuple(payload.input)
+    )
+
+    try:
+        resolved_provider = resolve_provider_name(payload.provider, settings)
+        resolved_model = resolve_model(resolved_provider, payload.model, settings)
+    except LLMError as exc:
+        record = LLMRequestRecord(
+            id=uuid.UUID(request_id),
+            user_id=user_id,
+            provider=payload.provider or "unresolved",
+            model=payload.model,
+            status=LLMRequestStatus.FAILED,
+            request_metadata_json=dict(payload.metadata),
+            error_code=type(exc).__name__,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db.add(record)
+        await db.commit()
+        raise
+
+    embedding_request = EmbeddingRequest(
+        request_id=request_id,
+        model=resolved_model,
+        input=normalized_input,
+        provider=resolved_provider,
+        metadata=payload.metadata,
+    )
+
+    record = LLMRequestRecord(
+        id=uuid.UUID(request_id),
+        user_id=user_id,
+        provider=resolved_provider,
+        model=resolved_model,
+        status=LLMRequestStatus.PENDING,
+        request_metadata_json=dict(payload.metadata),
+    )
+    db.add(record)
+    await db.commit()
+
+    started = time.monotonic()
+    try:
+        response = await gateway.embed(embedding_request)
+    except LLMError as exc:
+        record.status = LLMRequestStatus.FAILED
+        record.error_code = type(exc).__name__
+        record.latency_ms = int((time.monotonic() - started) * 1000)
+        record.completed_at = datetime.now(timezone.utc)
+        db.add(record)
+        await db.commit()
+        raise
+
+    record.status = LLMRequestStatus.SUCCEEDED
+    record.input_tokens = response.usage.input_tokens
+    record.output_tokens = response.usage.output_tokens
+    record.total_tokens = response.usage.total_tokens
+    record.estimated_cost_usd = response.estimated_cost_usd
+    record.latency_ms = int(response.latency_ms)
+    record.response_metadata_json = dict(response.metadata)
+    record.completed_at = datetime.now(timezone.utc)
+    db.add(record)
+    await db.commit()
+
+    return EmbedResponse(
+        request_id=response.request_id,
+        provider=response.provider,
+        model=response.model,
+        embeddings=[list(vec) for vec in response.embeddings],
+        input_tokens=response.usage.input_tokens,
+        estimated_cost_usd=response.estimated_cost_usd,
+        latency_ms=response.latency_ms,
+        created_at=response.created_at,
+        provider_request_id=response.provider_request_id,
         metadata=response.metadata,
     )
 

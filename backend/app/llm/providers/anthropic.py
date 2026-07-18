@@ -14,8 +14,22 @@ from datetime import datetime, timezone
 import httpx
 
 from app.llm.base import LLMProvider
-from app.llm.exceptions import LLMProviderUnavailable, LLMResponseError, LLMTimeoutError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
+from app.llm.exceptions import (
+    LLMEmbeddingNotSupported,
+    LLMProviderUnavailable,
+    LLMResponseError,
+    LLMTimeoutError,
+)
+from app.llm.models import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    ProviderHealth,
+    StreamChunk,
+    ToolCall,
+)
 from app.llm.providers._shared import map_http_error
 
 _API_VERSION = "2023-06-01"
@@ -193,3 +207,9 @@ class AnthropicProvider(LLMProvider):
                 latency_ms=latency_ms,
             )
         return ProviderHealth(provider=self.name, status="reachable", latency_ms=latency_ms)
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        # Anthropic has no embeddings API - raises immediately, no HTTP
+        # call attempted. Satisfies the LLMProvider ABC contract without
+        # adding real capability (Sprint P10A).
+        raise LLMEmbeddingNotSupported(self.name)

@@ -11,14 +11,35 @@ back".
 """
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMError
-from app.llm.models import LLMRequest, LLMResponse, LLMUsage, ProviderHealth, StreamChunk, ToolCall
+from app.llm.models import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    LLMRequest,
+    LLMResponse,
+    LLMUsage,
+    ProviderHealth,
+    StreamChunk,
+    ToolCall,
+)
 
 DEFAULT_MODEL = "fake-v1"
+DEFAULT_EMBEDDING_MODEL = "fake-embed-v1"
+_EMBEDDING_DIM = 8
+
+
+def _deterministic_embedding(text: str) -> tuple[float, ...]:
+    """A simple hash-based deterministic vector - not a real embedding
+    model, good enough for exercising the gateway's routing/cost
+    plumbing without a network call or a real embedding dependency, same
+    rationale as _deterministic_content above."""
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return tuple(b / 255.0 for b in digest[:_EMBEDDING_DIM])
 
 
 def _deterministic_content(request: LLMRequest) -> str:
@@ -111,3 +132,22 @@ class FakeProvider(LLMProvider):
                 detail=type(self._fail_with).__name__,
             )
         return ProviderHealth(provider=self.name, status="reachable", latency_ms=0.0)
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        if self._fail_with is not None:
+            raise self._fail_with
+
+        embeddings = tuple(_deterministic_embedding(text) for text in request.input)
+        input_tokens = sum(_count_tokens(text) for text in request.input)
+
+        return EmbeddingResponse(
+            request_id=request.request_id,
+            provider=self.name,
+            model=request.model or DEFAULT_EMBEDDING_MODEL,
+            embeddings=embeddings,
+            usage=LLMUsage(input_tokens=input_tokens, output_tokens=0),
+            latency_ms=0.0,
+            created_at=datetime.now(timezone.utc),
+            provider_request_id=f"fake-{request.request_id}",
+            metadata={},
+        )

@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from app.llm.exceptions import LLMTimeoutError
-from app.llm.models import LLMRequest, Message, ToolCall
+from app.llm.models import EmbeddingRequest, LLMRequest, Message, ToolCall
 from app.llm.providers.fake import FakeProvider
 
 
@@ -23,6 +23,16 @@ def _request(**overrides: Any) -> LLMRequest:
     }
     defaults.update(overrides)
     return LLMRequest(**defaults)
+
+
+def _embed_request(**overrides: Any) -> EmbeddingRequest:
+    defaults: dict[str, Any] = {
+        "request_id": str(uuid.uuid4()),
+        "model": "fake-embed-v1",
+        "input": ("hello there",),
+    }
+    defaults.update(overrides)
+    return EmbeddingRequest(**defaults)
 
 
 async def test_generate_is_deterministic_for_the_same_request() -> None:
@@ -114,3 +124,52 @@ async def test_tool_calls_override_are_returned_verbatim() -> None:
 
     assert response.tool_calls == (tool_call,)
     assert response.finish_reason == "tool_use"
+
+
+async def test_embed_returns_deterministic_vector_for_the_same_input() -> None:
+    provider = FakeProvider()
+    request = _embed_request()
+
+    first = await provider.embed(request)
+    second = await provider.embed(request)
+
+    assert first.embeddings == second.embeddings
+    assert len(first.embeddings) == 1
+    assert len(first.embeddings[0]) > 0
+
+
+async def test_embed_returns_different_vectors_for_different_input() -> None:
+    provider = FakeProvider()
+
+    a = await provider.embed(_embed_request(input=("hello",)))
+    b = await provider.embed(_embed_request(input=("goodbye",)))
+
+    assert a.embeddings != b.embeddings
+
+
+async def test_embed_supports_batch_input() -> None:
+    provider = FakeProvider()
+    request = _embed_request(input=("one", "two", "three"))
+
+    response = await provider.embed(request)
+
+    assert len(response.embeddings) == 3
+    assert response.embeddings[0] != response.embeddings[1]
+
+
+async def test_embed_reports_usage() -> None:
+    provider = FakeProvider()
+    request = _embed_request(input=("one two three",))
+
+    response = await provider.embed(request)
+
+    assert response.usage.input_tokens == 3
+    assert response.usage.output_tokens == 0
+    assert response.usage.total_tokens == 3
+
+
+async def test_embed_raises_fail_with_immediately() -> None:
+    provider = FakeProvider(fail_with=LLMTimeoutError("fake"))
+
+    with pytest.raises(LLMTimeoutError):
+        await provider.embed(_embed_request())

@@ -16,7 +16,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.enums import LLMRequestStatus
 
@@ -98,6 +98,47 @@ class GenerateResponse(BaseModel):
     created_at: datetime
     provider_request_id: str | None
     tool_calls: list[ToolCallOut] | None
+    metadata: dict[str, object]
+
+
+class EmbedRequest(BaseModel):
+    """Sprint P10A. `input` accepts either a single string or a list -
+    normalized to a tuple at the app.llm.models.EmbeddingRequest
+    boundary (app/services/llm_service.py's embed_and_persist) so every
+    provider adapter always deals with a batch of one-or-more, never a
+    single-vs-many branch of its own."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str | None = None
+    model: str = Field(min_length=1)
+    input: str | list[str]
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_not_empty(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("input must not be empty")
+            return v
+        if not v:
+            raise ValueError("input must contain at least one string")
+        if any(not item for item in v):
+            raise ValueError("input must not contain empty strings")
+        return v
+
+
+class EmbedResponse(BaseModel):
+    request_id: str
+    provider: str
+    model: str
+    embeddings: list[list[float]]
+    input_tokens: int
+    estimated_cost_usd: Decimal | None
+    latency_ms: float
+    created_at: datetime
+    provider_request_id: str | None
     metadata: dict[str, object]
 
 

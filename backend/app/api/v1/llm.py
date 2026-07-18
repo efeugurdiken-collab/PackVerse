@@ -18,6 +18,7 @@ from app.core.config import Settings, get_settings
 from app.database.session import get_db
 from app.llm.exceptions import (
     LLMAuthenticationError,
+    LLMEmbeddingNotSupported,
     LLMError,
     LLMInvalidRequest,
     LLMProviderNotConfigured,
@@ -33,6 +34,8 @@ from app.llm.gateway import LLMGateway
 from app.models.enums import UserRole
 from app.models.user import User
 from app.schemas.llm import (
+    EmbedRequest,
+    EmbedResponse,
     GenerateRequest,
     GenerateResponse,
     LLMRequestRead,
@@ -76,6 +79,12 @@ def _map_llm_error(exc: LLMError) -> HTTPException:
         )
     if isinstance(exc, LLMUnsupportedModel):
         return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    if isinstance(exc, LLMEmbeddingNotSupported):
+        # Sprint P10A: a well-formed request the chosen provider simply
+        # can't fulfill (e.g. Anthropic has no embeddings API) - same
+        # status family as LLMUnsupportedModel above, not a 503, since
+        # the provider itself is perfectly reachable/configured.
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
     if isinstance(exc, LLMStructuredOutputError):
         # Never include exc.raw_text (the provider's raw response) in an
         # API error body - see the Structured Output section's "do not
@@ -104,6 +113,24 @@ async def generate(
 ) -> GenerateResponse:
     try:
         return await llm_service.generate_and_persist(
+            db, gateway, settings, payload=payload, user_id=current_user.id
+        )
+    except LLMError as exc:
+        raise _map_llm_error(exc) from exc
+
+
+@router.post("/embed", response_model=EmbedResponse)
+async def embed(
+    payload: EmbedRequest,
+    db: AsyncSession = Depends(get_db),
+    gateway: LLMGateway = Depends(get_llm_gateway),
+    settings: Settings = Depends(get_settings),
+    current_user: User = Depends(_can_generate),
+) -> EmbedResponse:
+    """Sprint P10A. Same auth bar as /generate - embeddings cost real
+    provider tokens too, once a real (non-fake) provider is selected."""
+    try:
+        return await llm_service.embed_and_persist(
             db, gateway, settings, payload=payload, user_id=current_user.id
         )
     except LLMError as exc:

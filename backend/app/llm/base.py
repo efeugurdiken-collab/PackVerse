@@ -14,7 +14,14 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
-from app.llm.models import LLMRequest, LLMResponse, ProviderHealth, StreamChunk
+from app.llm.models import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    LLMRequest,
+    LLMResponse,
+    ProviderHealth,
+    StreamChunk,
+)
 
 
 class LLMProvider(ABC):
@@ -50,4 +57,14 @@ class LLMProvider(ABC):
         exception. app/llm/gateway.py's health_check relies on this to
         aggregate across providers without one failure taking down the
         whole /health endpoint."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        """Sprint P10A. Raises an app.llm.exceptions.LLMError subclass on
+        failure, same contract as generate() - including
+        LLMEmbeddingNotSupported for a provider (e.g. Anthropic) that has
+        no embeddings API at all; every concrete provider must still
+        implement this method to satisfy the ABC, even if its only job is
+        to raise that one exception immediately."""
         raise NotImplementedError

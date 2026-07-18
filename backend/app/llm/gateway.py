@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import replace
+from typing import TypeVar
 
 from jsonschema import ValidationError as JSONSchemaValidationError
 from jsonschema import validate as jsonschema_validate
@@ -21,9 +22,18 @@ from jsonschema import validate as jsonschema_validate
 from app.core.config import Settings
 from app.llm.base import LLMProvider
 from app.llm.exceptions import LLMError, LLMProviderNotConfigured, LLMStructuredOutputError
-from app.llm.models import LLMRequest, LLMResponse, ProviderHealth, StreamChunk
+from app.llm.models import (
+    EmbeddingRequest,
+    EmbeddingResponse,
+    LLMRequest,
+    LLMResponse,
+    ProviderHealth,
+    StreamChunk,
+)
 from app.llm.pricing import estimate_cost_usd
 from app.llm.routing import resolve_model, resolve_provider_name
+
+_T = TypeVar("_T")
 
 _BASE_RETRY_DELAY_SECONDS = 0.5
 
@@ -80,12 +90,33 @@ class LLMGateway:
         provider = self._get_provider(provider_name)
         resolved_request = replace(request, provider=provider_name, model=model)
 
-        response = await self._call_with_retry(provider, resolved_request)
+        response = await self._retry_async(lambda: provider.generate(resolved_request))
 
         if resolved_request.response_format is not None:
             _validate_structured_output(
                 response.content, resolved_request.response_format.json_schema
             )
+
+        cost = estimate_cost_usd(
+            self._settings,
+            provider=provider_name,
+            model=model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        return replace(response, estimated_cost_usd=cost)
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
+        """Sprint P10A. Same routing/retry/cost-estimation shape as
+        generate() above - a provider with no embeddings API (Anthropic)
+        raises LLMEmbeddingNotSupported, which is not retryable, so this
+        fails immediately rather than backing off and trying again."""
+        provider_name = resolve_provider_name(request.provider, self._settings)
+        model = resolve_model(provider_name, request.model, self._settings)
+        provider = self._get_provider(provider_name)
+        resolved_request = replace(request, provider=provider_name, model=model)
+
+        response = await self._retry_async(lambda: provider.embed(resolved_request))
 
         cost = estimate_cost_usd(
             self._settings,
@@ -138,11 +169,15 @@ class LLMGateway:
                 )
         return results
 
-    async def _call_with_retry(self, provider: LLMProvider, request: LLMRequest) -> LLMResponse:
+    async def _retry_async(self, operation: Callable[[], Coroutine[object, object, _T]]) -> _T:
+        """Shared retry/backoff loop for both generate() and embed() -
+        purely a mechanical extraction (Sprint P10A) of what was
+        previously generate()-only logic; behavior for generate() is
+        unchanged."""
         attempt = 0
         while True:
             try:
-                return await provider.generate(request)
+                return await operation()
             except LLMError as exc:
                 if not exc.retryable or attempt >= self._settings.llm_max_retries:
                     raise

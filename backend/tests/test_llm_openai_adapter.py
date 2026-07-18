@@ -20,7 +20,7 @@ from app.llm.exceptions import (
     LLMResponseError,
     LLMTimeoutError,
 )
-from app.llm.models import LLMRequest, Message, ResponseFormat, ToolDefinition
+from app.llm.models import EmbeddingRequest, LLMRequest, Message, ResponseFormat, ToolDefinition
 from app.llm.providers.openai_compatible import OpenAICompatibleProvider
 
 BASE_URL = "https://api.openai.test/v1"
@@ -257,3 +257,90 @@ async def test_health_check_unavailable_on_5xx(httpx_mock) -> None:
     health = await _provider().health_check()
 
     assert health.status == "unavailable"
+
+
+# --- Embeddings (Sprint P10A) ----------------------------------------
+
+
+def _embed_request(**overrides: object) -> EmbeddingRequest:
+    defaults: dict[str, object] = {
+        "request_id": "req-1",
+        "model": "text-embedding-3-small",
+        "input": ("hello",),
+    }
+    defaults.update(overrides)
+    return EmbeddingRequest(**defaults)  # type: ignore[arg-type]
+
+
+def _embed_success_body(
+    *, vectors: list[list[float]] | None = None, prompt_tokens: int = 5, total_tokens: int = 5
+) -> dict[str, object]:
+    vectors = vectors if vectors is not None else [[0.1, 0.2, 0.3]]
+    return {
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": vec, "index": i} for i, vec in enumerate(vectors)
+        ],
+        "model": "text-embedding-3-small",
+        "usage": {"prompt_tokens": prompt_tokens, "total_tokens": total_tokens},
+    }
+
+
+async def test_embed_request_mapping_sends_model_and_input(httpx_mock) -> None:
+    httpx_mock.add_response(url=f"{BASE_URL}/embeddings", method="POST", json=_embed_success_body())
+
+    await _provider().embed(_embed_request(input=("hello", "world")))
+
+    sent = httpx_mock.get_requests()[0]
+    assert sent.headers["authorization"] == "Bearer test-openai-key"
+    body = json.loads(sent.content)
+    assert body["model"] == "text-embedding-3-small"
+    assert body["input"] == ["hello", "world"]
+
+
+async def test_embed_response_mapping_returns_vector_and_usage(httpx_mock) -> None:
+    httpx_mock.add_response(
+        json=_embed_success_body(vectors=[[0.1, 0.2, 0.3]], prompt_tokens=7, total_tokens=7)
+    )
+
+    response = await _provider().embed(_embed_request())
+
+    assert response.embeddings == ((0.1, 0.2, 0.3),)
+    assert response.usage.input_tokens == 7
+    assert response.usage.output_tokens == 0
+    assert response.provider == "openai"
+
+
+async def test_embed_supports_batch_input(httpx_mock) -> None:
+    httpx_mock.add_response(
+        json=_embed_success_body(vectors=[[0.1, 0.1], [0.2, 0.2], [0.3, 0.3]])
+    )
+
+    response = await _provider().embed(_embed_request(input=("a", "b", "c")))
+
+    assert len(response.embeddings) == 3
+    assert response.embeddings[0] == (0.1, 0.1)
+    assert response.embeddings[2] == (0.3, 0.3)
+
+
+async def test_embed_error_mapping_reuses_shared_http_error_mapping(httpx_mock) -> None:
+    httpx_mock.add_response(
+        status_code=401, json={"error": {"message": "invalid api key", "type": "invalid_request_error"}}
+    )
+
+    with pytest.raises(LLMAuthenticationError):
+        await _provider().embed(_embed_request())
+
+
+async def test_embed_timeout_mapping(httpx_mock) -> None:
+    httpx_mock.add_exception(httpx.TimeoutException("timed out"))
+
+    with pytest.raises(LLMTimeoutError):
+        await _provider().embed(_embed_request())
+
+
+async def test_embed_unexpected_response_shape_raises_response_error(httpx_mock) -> None:
+    httpx_mock.add_response(json={"data": "not-a-list"})
+
+    with pytest.raises(LLMResponseError):
+        await _provider().embed(_embed_request())

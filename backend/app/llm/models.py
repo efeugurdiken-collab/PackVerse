@@ -123,6 +123,44 @@ class StreamChunk:
     finish_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class EmbeddingRequest:
+    """Provider-agnostic embedding request (Sprint P10A). `input` is
+    always a tuple, even for a single string - callers never build a
+    provider-specific batch payload themselves, and a future retrieval
+    pipeline can pass many chunks in one call without a shape change
+    here. Never carries a resolved API key, same guarantee as
+    LLMRequest."""
+
+    request_id: str
+    model: str
+    input: tuple[str, ...]
+    provider: str | None = None
+    timeout_seconds: float | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EmbeddingResponse:
+    """Normalized embedding response - identical shape regardless of
+    which provider actually served the request. One vector per input
+    string, in the same order. Embeddings have no "output tokens" -
+    usage.output_tokens is always 0, kept on LLMUsage rather than a
+    separate type so app/llm/pricing.py's estimate_cost_usd needs no
+    embedding-specific branch."""
+
+    request_id: str
+    provider: str
+    model: str
+    embeddings: tuple[tuple[float, ...], ...]
+    usage: LLMUsage
+    latency_ms: float
+    created_at: datetime
+    provider_request_id: str | None = None
+    estimated_cost_usd: Decimal | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
 ProviderHealthStatus = Literal["configured", "reachable", "unavailable", "not_configured"]
 
 

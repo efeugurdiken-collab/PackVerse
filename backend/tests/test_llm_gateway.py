@@ -20,13 +20,21 @@ import pytest
 
 from app.core.config import Settings
 from app.llm.exceptions import (
+    LLMEmbeddingNotSupported,
     LLMInvalidRequest,
     LLMProviderNotConfigured,
     LLMRateLimitError,
     LLMTimeoutError,
 )
 from app.llm.gateway import LLMGateway
-from app.llm.models import LLMRequest, Message, ResponseFormat, ToolCall, ToolDefinition
+from app.llm.models import (
+    EmbeddingRequest,
+    LLMRequest,
+    Message,
+    ResponseFormat,
+    ToolCall,
+    ToolDefinition,
+)
 from app.llm.providers.fake import FakeProvider
 
 
@@ -48,6 +56,12 @@ def _request(
         provider=provider,
         response_format=response_format,
         tools=tools,
+    )
+
+
+def _embed_request(*, provider: str | None = None, model: str = "m1") -> EmbeddingRequest:
+    return EmbeddingRequest(
+        request_id=str(uuid.uuid4()), model=model, input=("hi",), provider=provider
     )
 
 
@@ -277,3 +291,73 @@ async def test_stream_yields_chunks_and_a_final_finish_reason() -> None:
 
     assert chunks
     assert chunks[-1].finish_reason == "stop"
+
+
+# --- Embeddings (Sprint P10A) ---------------------------------------------
+
+
+async def test_embed_routes_to_explicit_provider() -> None:
+    settings = _settings(llm_allowed_providers="fake")
+    gateway = LLMGateway({"fake": FakeProvider()}, settings)
+
+    response = await gateway.embed(_embed_request(provider="fake"))
+
+    assert response.provider == "fake"
+    assert len(response.embeddings) == 1
+
+
+async def test_embed_missing_provider_raises_when_nothing_configured() -> None:
+    settings = _settings(llm_allowed_providers="fake")
+    gateway = LLMGateway({"fake": FakeProvider()}, settings)
+
+    with pytest.raises(LLMProviderNotConfigured):
+        await gateway.embed(_embed_request(provider=None))
+
+
+async def test_embed_retries_transient_failure_and_succeeds() -> None:
+    calls = {"n": 0}
+
+    class FlakyEmbedder(FakeProvider):
+        async def embed(self, request):  # type: ignore[override]
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise LLMTimeoutError("fake")
+            return await super().embed(request)
+
+    settings = _settings(llm_allowed_providers="fake", llm_max_retries=2)
+    gateway = LLMGateway({"fake": FlakyEmbedder()}, settings, retry_base_delay_seconds=0.0)
+
+    response = await gateway.embed(_embed_request(provider="fake"))
+
+    assert calls["n"] == 2
+    assert response.embeddings
+
+
+async def test_embed_non_retryable_error_does_not_retry() -> None:
+    calls = {"n": 0}
+
+    class NeverEmbeds(FakeProvider):
+        async def embed(self, request):  # type: ignore[override]
+            calls["n"] += 1
+            raise LLMEmbeddingNotSupported("fake")
+
+    settings = _settings(llm_allowed_providers="fake", llm_max_retries=3)
+    gateway = LLMGateway({"fake": NeverEmbeds()}, settings, retry_base_delay_seconds=0.0)
+
+    with pytest.raises(LLMEmbeddingNotSupported):
+        await gateway.embed(_embed_request(provider="fake"))
+
+    assert calls["n"] == 1  # never retried
+
+
+async def test_embed_cost_estimation_uses_configured_pricing() -> None:
+    settings = _settings(
+        llm_allowed_providers="fake",
+        llm_pricing_json='{"fake:m1": {"input_per_1k": "1.00", "output_per_1k": "2.00"}}',
+    )
+    gateway = LLMGateway({"fake": FakeProvider()}, settings)
+
+    response = await gateway.embed(_embed_request(provider="fake", model="m1"))
+
+    assert response.estimated_cost_usd is not None
+    assert response.estimated_cost_usd > Decimal("0")

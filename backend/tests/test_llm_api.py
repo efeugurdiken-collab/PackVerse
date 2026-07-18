@@ -19,6 +19,7 @@ from app.llm.exceptions import LLMRateLimitError, LLMTimeoutError
 from app.llm.factory import get_llm_gateway
 from app.llm.gateway import LLMGateway
 from app.llm.models import ToolCall
+from app.llm.providers.anthropic import AnthropicProvider
 from app.llm.providers.fake import FakeProvider
 from app.main import app
 from app.models.enums import UserRole
@@ -62,6 +63,12 @@ def _payload(**overrides: object) -> dict:
         "model": "fake-v1",
         "messages": [{"role": "user", "content": "hello"}],
     }
+    payload.update(overrides)
+    return payload
+
+
+def _embed_payload(**overrides: object) -> dict:
+    payload: dict[str, object] = {"provider": "fake", "model": "fake-embed-v1", "input": "hello"}
     payload.update(overrides)
     return payload
 
@@ -188,6 +195,71 @@ async def test_generate_with_unconfigured_provider_returns_503(client, operator_
     )
 
     assert response.status_code == 503
+
+
+# --- Embed (Sprint P10A) --------------------------------------------------
+
+
+async def test_embed_requires_authentication(client, llm_gateway_override) -> None:
+    response = await client.post(f"{BASE}/embed", json=_embed_payload())
+    assert response.status_code == 401
+
+
+async def test_viewer_embed_returns_403(client, llm_gateway_override, viewer_headers) -> None:
+    response = await client.post(f"{BASE}/embed", json=_embed_payload(), headers=viewer_headers)
+    assert response.status_code == 403
+
+
+async def test_operator_embed_succeeds(client, llm_gateway_override, operator_headers) -> None:
+    response = await client.post(f"{BASE}/embed", json=_embed_payload(), headers=operator_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "fake"
+    assert len(body["embeddings"]) == 1
+
+
+async def test_embed_batch_input_returns_one_vector_per_input(
+    client, llm_gateway_override, operator_headers
+) -> None:
+    response = await client.post(
+        f"{BASE}/embed",
+        json=_embed_payload(input=["hello", "world", "foo"]),
+        headers=operator_headers,
+    )
+    assert response.status_code == 200
+    assert len(response.json()["embeddings"]) == 3
+
+
+async def test_embed_with_anthropic_provider_returns_422(client, operator_headers) -> None:
+    settings = _llm_settings(llm_allowed_providers="fake,anthropic")
+    gateway = LLMGateway(
+        {"fake": FakeProvider(), "anthropic": AnthropicProvider(api_key="test-key")},
+        settings,
+        retry_base_delay_seconds=0.0,
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_llm_gateway] = lambda: gateway
+
+    response = await client.post(
+        f"{BASE}/embed",
+        json=_embed_payload(provider="anthropic", model="claude-3-5-haiku-20241022"),
+        headers=operator_headers,
+    )
+
+    assert response.status_code == 422
+
+
+async def test_embed_persists_to_llm_requests_with_zero_output_tokens(
+    client, llm_gateway_override, operator_headers, db_session
+) -> None:
+    created = await client.post(f"{BASE}/embed", json=_embed_payload(), headers=operator_headers)
+    request_id = uuid.UUID(created.json()["request_id"])
+
+    record = await db_session.get(LLMRequestRecord, request_id)
+    assert record is not None
+    assert record.status.value == "succeeded"
+    assert record.output_tokens == 0
+    assert record.total_tokens == record.input_tokens
 
 
 # --- Providers / models / health ------------------------------------------
