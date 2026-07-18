@@ -18,7 +18,7 @@ jobs:
       - name: Create .env from example
         run: |
           cp .env.example .env
-          sed -i 's/^LLM_DEFAULT_PROVIDER=.*/LLM_DEFAULT_PROVIDER=fake/' .env
+          sed -i '/^LLM_DEFAULT_PROVIDER=/d' .env
 
       - name: Start db and backend
         run: docker compose up --build -d db backend
@@ -40,6 +40,9 @@ jobs:
 
       - name: Run migrations
         run: docker compose exec -T backend alembic upgrade head
+
+      - name: Create test database
+        run: docker compose exec -T db createdb -U packverse packverse_test
 
       - name: Start worker
         run: docker compose up --build -d worker
