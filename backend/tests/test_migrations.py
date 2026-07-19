@@ -27,6 +27,7 @@ P6_REVISION = "a1c8f7d2b3e9"
 P7_REVISION = "d4e6b9a3f1c7"
 P8_REVISION = "b7f3e9a1c5d2"  # head as of Sprint P8
 P9C2_REVISION = "d657afc740be"  # head as of Sprint P9C2
+P10B1_REVISION = "ad3f998eece8"  # head as of Sprint P10B1
 
 EXPECTED_TABLES = {
     "products",
@@ -40,6 +41,7 @@ EXPECTED_TABLES = {
     "workflow_runs",
     "workflow_step_runs",
     "worker_heartbeats",
+    "document_chunks",
 }
 
 # Columns Sprint P8's migration adds to the pre-existing (P2-era, always
@@ -114,6 +116,7 @@ def test_migration_revision_identifiers_match_expected() -> None:
         P7_REVISION,
         P8_REVISION,
         P9C2_REVISION,
+        P10B1_REVISION,
     ):
         matches = list(versions_dir.glob(f"{revision}_*.py"))
         assert len(matches) == 1, f"expected exactly one migration file for {revision}"
@@ -154,6 +157,7 @@ def test_migration_downgrade_to_p2_preserves_domain_tables(test_sync_database_ur
                 "workflow_runs",
                 "workflow_step_runs",
                 "worker_heartbeats",
+                "document_chunks",
             }
             <= table_names
         )
@@ -195,6 +199,7 @@ def test_migration_downgrade_to_p4_removes_only_p4_columns(
             "workflow_runs",
             "workflow_step_runs",
             "worker_heartbeats",
+            "document_chunks",
         }
         assert EXPECTED_TABLES - removed <= table_names
         assert removed.isdisjoint(table_names)
@@ -247,7 +252,10 @@ def test_migration_downgrade_to_p5_removes_agent_runs_and_workflow_run_tables(
         asset_columns = {col["name"] for col in inspector.get_columns("assets")}
         engine.dispose()
 
-        removed = {"agent_runs", "workflow_runs", "workflow_step_runs", "worker_heartbeats"}
+        removed = {
+            "agent_runs", "workflow_runs", "workflow_step_runs", "worker_heartbeats",
+            "document_chunks",
+        }
         assert removed.isdisjoint(table_names)
         assert EXPECTED_TABLES - removed <= table_names
 
@@ -287,7 +295,7 @@ def test_migration_downgrade_to_p6_removes_only_workflow_run_tables(
         assert "worker_heartbeats" not in table_names
         assert "agent_runs" in table_names
         assert "llm_requests" in table_names
-        removed = {"workflow_runs", "workflow_step_runs", "worker_heartbeats"}
+        removed = {"workflow_runs", "workflow_step_runs", "worker_heartbeats", "document_chunks"}
         assert EXPECTED_TABLES - removed <= table_names
 
         p4_columns = {
@@ -326,7 +334,7 @@ def test_migration_downgrade_to_p7_removes_only_p8_additions(
         assert "jobs" in table_names
         assert "workflow_runs" in table_names
         assert "workflow_step_runs" in table_names
-        assert EXPECTED_TABLES - {"worker_heartbeats"} <= table_names
+        assert EXPECTED_TABLES - {"worker_heartbeats", "document_chunks"} <= table_names
 
         assert P8_JOBS_COLUMNS.isdisjoint(jobs_columns)
         pre_p8_jobs_columns = {
@@ -340,13 +348,55 @@ def test_migration_downgrade_to_p7_removes_only_p8_additions(
         command.downgrade(cfg, "base")
 
 
-def test_migration_downgrade_one_step_from_head_removes_only_p9c2_additions(
+def test_migration_downgrade_to_p9c2_removes_tool_calls_json(
     test_sync_database_url: str,
 ) -> None:
-    """`alembic downgrade -1` from the true current head (P9C2) must
-    remove exactly tool_calls_json from agent_runs and nothing else -
-    every other agent_runs column, and every P1-P8 table including
-    worker_heartbeats and the P8 jobs columns, must survive untouched."""
+    """Downgrading from head (P10B1) to the explicit P9C2_REVISION target
+    stops right after P9C2's own migration - P9C2 stays fully applied,
+    only P10B1's own additions (document_chunks, the vector extension)
+    are undone. tool_calls_json (P9C2's own addition on top of P8) must
+    still be present; every other agent_runs column, and every P1-P8
+    table including worker_heartbeats and the P8 jobs columns, must
+    survive untouched."""
+    cfg = _alembic_config(test_sync_database_url)
+    command.upgrade(cfg, "head")
+    try:
+        command.downgrade(cfg, P9C2_REVISION)
+
+        engine = sa.create_engine(test_sync_database_url)
+        inspector = sa.inspect(engine)
+        table_names = set(inspector.get_table_names())
+        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
+        jobs_columns = {col["name"] for col in inspector.get_columns("jobs")}
+        engine.dispose()
+
+        assert "document_chunks" not in table_names
+        assert "tool_calls_json" in agent_run_columns
+        other_agent_run_columns = {
+            "id", "agent_id", "created_by_user_id", "status", "llm_request_id",
+            "provider", "model", "input_tokens", "output_tokens", "total_tokens",
+            "estimated_cost_usd", "output_text", "error_code", "error_message",
+            "duration_ms", "started_at", "completed_at", "created_at", "updated_at",
+        }
+        assert other_agent_run_columns <= agent_run_columns
+        assert "worker_heartbeats" in table_names
+        assert P8_JOBS_COLUMNS <= jobs_columns
+        assert EXPECTED_TABLES - {"document_chunks"} <= table_names
+
+        command.upgrade(cfg, "head")
+    finally:
+        command.downgrade(cfg, "base")
+
+
+def test_migration_downgrade_one_step_from_head_removes_only_p10b1_additions(
+    test_sync_database_url: str,
+) -> None:
+    """`alembic downgrade -1` from the true current head (P10B1) must
+    remove exactly document_chunks and the vector extension, and nothing
+    else - every P1-P9C2 table/column, including agent_runs'
+    tool_calls_json, worker_heartbeats, and the P8 jobs columns, must
+    survive untouched. Re-upgrading to head must recreate document_chunks
+    and the extension cleanly."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -357,25 +407,24 @@ def test_migration_downgrade_one_step_from_head_removes_only_p9c2_additions(
         table_names = set(inspector.get_table_names())
         agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
         jobs_columns = {col["name"] for col in inspector.get_columns("jobs")}
+        with engine.connect() as conn:
+            extension_exists = conn.execute(
+                sa.text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+            ).first()
         engine.dispose()
 
-        assert "tool_calls_json" not in agent_run_columns
-        other_agent_run_columns = {
-            "id", "agent_id", "created_by_user_id", "status", "llm_request_id",
-            "provider", "model", "input_tokens", "output_tokens", "total_tokens",
-            "estimated_cost_usd", "output_text", "error_code", "error_message",
-            "duration_ms", "started_at", "completed_at", "created_at", "updated_at",
-        }
-        assert other_agent_run_columns <= agent_run_columns
+        assert "document_chunks" not in table_names
+        assert extension_exists is None
+        assert "tool_calls_json" in agent_run_columns
         assert "worker_heartbeats" in table_names
         assert P8_JOBS_COLUMNS <= jobs_columns
-        assert EXPECTED_TABLES <= table_names
+        assert EXPECTED_TABLES - {"document_chunks"} <= table_names
 
         command.upgrade(cfg, "head")
         engine = sa.create_engine(test_sync_database_url)
         inspector = sa.inspect(engine)
-        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
+        table_names = set(inspector.get_table_names())
         engine.dispose()
-        assert "tool_calls_json" in agent_run_columns
+        assert "document_chunks" in table_names
     finally:
         command.downgrade(cfg, "base")

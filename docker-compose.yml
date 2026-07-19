@@ -1,6 +1,11 @@
 services:
   db:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 (Sprint P10B1) is built on top of postgres:16 -
+    # same major version as the plain postgres:16-alpine image this
+    # replaces, so the existing packverse_pgdata volume stays binary-
+    # compatible (no reinit needed). Needed to CREATE EXTENSION vector -
+    # see backend/alembic/versions/ad3f998eece8_*.py.
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-packverse}

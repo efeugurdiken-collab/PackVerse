@@ -18,6 +18,7 @@ Requires a reachable PostgreSQL instance at settings.test_database_url
 (defaults to "<postgres_db>_test"). Create it once, e.g.:
     docker compose exec db createdb -U packverse packverse_test
 """
+import hashlib
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
@@ -42,6 +43,7 @@ from app.models.enums import (
     UserStatus,
     WorkflowStatus,
 )
+from app.models.document_chunk import DocumentChunk
 from app.models.job import Job
 from app.models.product import Product
 from app.models.user import User
@@ -345,6 +347,43 @@ def make_job(
         return job
 
     return _make_job
+
+
+@pytest.fixture
+def make_document_chunk(
+    db_session: AsyncSession,
+) -> Callable[..., Awaitable[DocumentChunk]]:
+    """Factory fixture: `await make_document_chunk(asset_id=asset.id)`
+    inserts a DocumentChunk directly via the ORM and returns it (Sprint
+    P10B1). No auto-created parent Asset - same "caller supplies the
+    required foreign key" convention as make_job's target_run_id;
+    document_chunks tests construct their own Product/Asset first, the
+    same way tests/test_models.py does, since there is no make_asset
+    fixture in this codebase either."""
+
+    async def _make_document_chunk(
+        *,
+        asset_id: uuid.UUID,
+        chunk_index: int = 0,
+        content: str = "Test chunk content.",
+        char_start: int = 0,
+        char_end: int | None = None,
+        content_hash: str | None = None,
+    ) -> DocumentChunk:
+        chunk = DocumentChunk(
+            asset_id=asset_id,
+            chunk_index=chunk_index,
+            content=content,
+            content_hash=content_hash or hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            char_start=char_start,
+            char_end=char_end if char_end is not None else len(content),
+        )
+        db_session.add(chunk)
+        await db_session.commit()
+        await db_session.refresh(chunk)
+        return chunk
+
+    return _make_document_chunk
 
 
 @pytest.fixture
