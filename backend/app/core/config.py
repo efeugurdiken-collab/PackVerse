@@ -85,11 +85,16 @@ class Settings(BaseSettings):
     # Do not add application/x-msdownload, application/x-executable, or
     # similar - see the File Validation security rule against silently
     # accepting arbitrary executables.
+    # text/plain and text/markdown were added in Sprint P10B2 so a source
+    # document can be uploaded as an Asset and then ingested (see
+    # app/services/ingestion_service.py) - not part of the original P4
+    # product-asset allowlist above.
     allowed_mime_types: str = (
         "image/png,image/jpeg,image/webp,image/svg+xml,"
         "application/pdf,application/zip,application/json,"
         "font/ttf,font/otf,"
-        "model/stl,application/sla,application/octet-stream"
+        "model/stl,application/sla,application/octet-stream,"
+        "text/plain,text/markdown"
     )
 
     # --- LLM Gateway (Sprint P5) ---

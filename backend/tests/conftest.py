@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
@@ -66,9 +66,22 @@ def test_sync_database_url() -> str:
 
 @pytest.fixture
 async def test_engine() -> AsyncGenerator[AsyncEngine, None]:
-    """Creates the schema for this test's event loop, drops it afterward."""
+    """Creates the schema for this test's event loop, drops it afterward.
+
+    CREATE EXTENSION IF NOT EXISTS vector runs first (Sprint P10B2) since
+    Base.metadata.create_all() below - unlike `alembic upgrade head`
+    against the dev/prod database - never runs the P10B1 migration's own
+    "CREATE EXTENSION vector" statement; without it, creating
+    document_chunks' pgvector `embedding` column fails with "type
+    'vector' does not exist" on a fresh packverse_test database. Never
+    dropped in the `finally` block below: it's a database-level object,
+    not part of Base.metadata, so drop_all() wouldn't touch it anyway,
+    and leaving it enabled is exactly what `alembic upgrade head`
+    against a real database already does permanently too.
+    """
     engine = create_async_engine(settings.test_database_url)
     async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
     try:
         yield engine

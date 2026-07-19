@@ -27,7 +27,8 @@ P6_REVISION = "a1c8f7d2b3e9"
 P7_REVISION = "d4e6b9a3f1c7"
 P8_REVISION = "b7f3e9a1c5d2"  # head as of Sprint P8
 P9C2_REVISION = "d657afc740be"  # head as of Sprint P9C2
-P10B1_REVISION = "ad3f998eece8"  # head as of Sprint P10B1
+P10B1_REVISION = "ad3f998eece8"
+P10B2_REVISION = "e4ba9bdd172a"  # head as of Sprint P10B2
 
 EXPECTED_TABLES = {
     "products",
@@ -117,6 +118,7 @@ def test_migration_revision_identifiers_match_expected() -> None:
         P8_REVISION,
         P9C2_REVISION,
         P10B1_REVISION,
+        P10B2_REVISION,
     ):
         matches = list(versions_dir.glob(f"{revision}_*.py"))
         assert len(matches) == 1, f"expected exactly one migration file for {revision}"
@@ -388,15 +390,61 @@ def test_migration_downgrade_to_p9c2_removes_tool_calls_json(
         command.downgrade(cfg, "base")
 
 
-def test_migration_downgrade_one_step_from_head_removes_only_p10b1_additions(
+def test_migration_downgrade_to_p10b1_removes_embedding_columns(
     test_sync_database_url: str,
 ) -> None:
-    """`alembic downgrade -1` from the true current head (P10B1) must
-    remove exactly document_chunks and the vector extension, and nothing
-    else - every P1-P9C2 table/column, including agent_runs'
-    tool_calls_json, worker_heartbeats, and the P8 jobs columns, must
-    survive untouched. Re-upgrading to head must recreate document_chunks
-    and the extension cleanly."""
+    """Downgrading from head (P10B2) to the explicit P10B1_REVISION
+    target stops right after P10B1's own migration - P10B1 stays fully
+    applied (document_chunks and the vector extension present), only
+    P10B2's own additions (the embedding/embedding_model/
+    embedding_provider columns) are undone. Every P1-P9C2 table/column,
+    including agent_runs' tool_calls_json, worker_heartbeats, and the P8
+    jobs columns, must survive untouched."""
+    cfg = _alembic_config(test_sync_database_url)
+    command.upgrade(cfg, "head")
+    try:
+        command.downgrade(cfg, P10B1_REVISION)
+
+        engine = sa.create_engine(test_sync_database_url)
+        inspector = sa.inspect(engine)
+        table_names = set(inspector.get_table_names())
+        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
+        jobs_columns = {col["name"] for col in inspector.get_columns("jobs")}
+        document_chunk_columns = {col["name"] for col in inspector.get_columns("document_chunks")}
+        with engine.connect() as conn:
+            extension_exists = conn.execute(
+                sa.text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+            ).first()
+        engine.dispose()
+
+        assert "document_chunks" in table_names
+        assert extension_exists is not None
+        assert {"embedding", "embedding_model", "embedding_provider"}.isdisjoint(
+            document_chunk_columns
+        )
+        pre_p10b2_document_chunk_columns = {
+            "id", "asset_id", "chunk_index", "content", "content_hash",
+            "char_start", "char_end", "created_at", "updated_at",
+        }
+        assert pre_p10b2_document_chunk_columns <= document_chunk_columns
+        assert "tool_calls_json" in agent_run_columns
+        assert "worker_heartbeats" in table_names
+        assert P8_JOBS_COLUMNS <= jobs_columns
+        assert EXPECTED_TABLES <= table_names
+
+        command.upgrade(cfg, "head")
+    finally:
+        command.downgrade(cfg, "base")
+
+
+def test_migration_downgrade_one_step_from_head_removes_only_p10b2_additions(
+    test_sync_database_url: str,
+) -> None:
+    """`alembic downgrade -1` from the true current head (P10B2) must
+    remove exactly the embedding/embedding_model/embedding_provider
+    columns, and nothing else - document_chunks itself, the vector
+    extension, and every P1-P10B1 table/column must survive untouched.
+    Re-upgrading to head must recreate all three columns cleanly."""
     cfg = _alembic_config(test_sync_database_url)
     command.upgrade(cfg, "head")
     try:
@@ -405,26 +453,25 @@ def test_migration_downgrade_one_step_from_head_removes_only_p10b1_additions(
         engine = sa.create_engine(test_sync_database_url)
         inspector = sa.inspect(engine)
         table_names = set(inspector.get_table_names())
-        agent_run_columns = {col["name"] for col in inspector.get_columns("agent_runs")}
-        jobs_columns = {col["name"] for col in inspector.get_columns("jobs")}
+        document_chunk_columns = {col["name"] for col in inspector.get_columns("document_chunks")}
         with engine.connect() as conn:
             extension_exists = conn.execute(
                 sa.text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
             ).first()
         engine.dispose()
 
-        assert "document_chunks" not in table_names
-        assert extension_exists is None
-        assert "tool_calls_json" in agent_run_columns
-        assert "worker_heartbeats" in table_names
-        assert P8_JOBS_COLUMNS <= jobs_columns
-        assert EXPECTED_TABLES - {"document_chunks"} <= table_names
+        assert "document_chunks" in table_names
+        assert extension_exists is not None
+        assert {"embedding", "embedding_model", "embedding_provider"}.isdisjoint(
+            document_chunk_columns
+        )
+        assert EXPECTED_TABLES <= table_names
 
         command.upgrade(cfg, "head")
         engine = sa.create_engine(test_sync_database_url)
         inspector = sa.inspect(engine)
-        table_names = set(inspector.get_table_names())
+        document_chunk_columns = {col["name"] for col in inspector.get_columns("document_chunks")}
         engine.dispose()
-        assert "document_chunks" in table_names
+        assert {"embedding", "embedding_model", "embedding_provider"} <= document_chunk_columns
     finally:
         command.downgrade(cfg, "base")

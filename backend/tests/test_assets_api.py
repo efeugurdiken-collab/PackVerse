@@ -129,13 +129,17 @@ async def test_upload_oversized_file_is_rejected(client, operator_headers, produ
 
 
 async def test_upload_unsupported_mime_type_is_rejected(client, operator_headers, product) -> None:
+    # text/csv is deliberately never in allowed_mime_types_list - unlike
+    # text/plain and text/markdown, which Sprint P10B2 added so a source
+    # document can be uploaded and then ingested (see
+    # app/services/ingestion_service.py).
     response = await _upload(
         client,
         operator_headers,
         product.id,
         content=b"just some text",
-        filename="notes.txt",
-        content_type="text/plain",
+        filename="notes.csv",
+        content_type="text/csv",
     )
     assert response.status_code == 415
 

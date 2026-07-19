@@ -117,3 +117,79 @@ class LLMRequestNotFoundError(DomainError):
     def __init__(self, request_id: object) -> None:
         super().__init__(f"LLM request {request_id} not found")
         self.request_id = request_id
+
+
+# --- Ingestion domain errors (Sprint P10B2) ---
+# Raised by app/services/ingestion_service.py's ingest_asset(). Lower-
+# level extraction failures (app.rag.exceptions.ExtractionError and its
+# subclasses) are caught inside ingest_asset() and re-raised as
+# IngestionExtractionFailedError below, same "wrap the lower-level
+# module's own exception hierarchy at the service boundary" pattern as
+# AssetStorageOperationFailedError above for app.storage.exceptions.
+# app.llm.exceptions.LLMError is deliberately NOT wrapped here - it
+# propagates from ingest_asset() unchanged, same as it already does from
+# app/services/llm_service.py's generate_and_persist/embed_and_persist.
+
+
+class AssetNotIngestableError(DomainError):
+    """Raised when the asset's content type has no text extractor - see
+    app/rag/extraction.py's extract_text(). Checked before any storage
+    read or embedding call, so this is always a no-op failure."""
+
+    def __init__(self, asset_id: object, content_type: str) -> None:
+        super().__init__(f"Asset {asset_id} has no ingestable content type {content_type!r}")
+        self.asset_id = asset_id
+        self.content_type = content_type
+
+
+class AssetAlreadyIngestedError(DomainError):
+    """ingest_asset() is write-once per asset (Sprint P10B2 deliberately
+    excludes re-ingestion/replace workflows): raised when document_chunks
+    rows already exist for this asset_id, whether detected by the
+    upfront check or by losing a concurrent-ingestion race at commit
+    time (a duplicate-key IntegrityError on the
+    (asset_id, chunk_index) unique constraint) - both cases mean the
+    same thing to a caller: this asset has already been ingested."""
+
+    def __init__(self, asset_id: object) -> None:
+        super().__init__(f"Asset {asset_id} has already been ingested")
+        self.asset_id = asset_id
+
+
+class IngestionExtractionFailedError(DomainError):
+    """Wraps a lower-level app.rag.exceptions.ExtractionError (corrupt/
+    encrypted PDF, non-UTF-8 plain text) so callers only ever need to
+    catch domain errors, never reach into app.rag.exceptions directly."""
+
+    def __init__(self, asset_id: object, reason: str) -> None:
+        super().__init__(f"Text extraction failed for asset {asset_id}: {reason}")
+        self.asset_id = asset_id
+
+
+class EmptyExtractedTextError(DomainError):
+    """Raised when extraction succeeded but produced no non-whitespace
+    text - e.g. a scanned/image-only PDF with no text layer. Not an
+    extraction failure (extract_text() returned normally); OCR would be
+    needed to do anything with such a document, and OCR is out of scope
+    for this sprint."""
+
+    def __init__(self, asset_id: object) -> None:
+        super().__init__(f"Asset {asset_id} produced no extractable text")
+        self.asset_id = asset_id
+
+
+class IngestionEmbeddingMismatchError(DomainError):
+    """Defensive check, not expected to ever fire in practice:
+    app.llm.models.EmbeddingResponse's contract is "one vector per input
+    string, in the same order" (see that class's docstring), but
+    ingest_asset() verifies the count before zipping chunks to vectors
+    rather than trusting a provider adapter never to violate it - a
+    silent mismatch would attach the wrong vector to the wrong chunk."""
+
+    def __init__(self, asset_id: object, expected: int, actual: int) -> None:
+        super().__init__(
+            f"Asset {asset_id}: expected {expected} embeddings, provider returned {actual}"
+        )
+        self.asset_id = asset_id
+        self.expected = expected
+        self.actual = actual
