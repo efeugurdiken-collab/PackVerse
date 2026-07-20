@@ -1,13 +1,23 @@
-"""Asset API endpoints (Sprint P4).
+"""Asset API endpoints (Sprint P4; ingestion added in Sprint P10B3).
 
 Two URL namespaces share this router: uploads/listing are nested under
 their product (POST/GET /products/{product_id}/assets), while detail,
-download, and delete address an asset directly (/assets/{asset_id}...) -
-matching the sprint spec exactly rather than forcing everything under one
-prefix.
+download, delete, and ingestion address an asset directly
+(/assets/{asset_id}...) - matching the sprint spec exactly rather than
+forcing everything under one prefix.
 
 Authorization mirrors the Product API: any active role can read
-(list/detail/download), only operator/admin can upload or delete.
+(list/detail/download/ingestion status), only operator/admin can upload,
+delete, or request ingestion.
+
+POST /assets/{asset_id}/ingest enqueues a durable Job
+(app/jobs/service.py's enqueue_asset_ingestion) and returns 202
+Accepted rather than calling app.services.ingestion_service.
+ingest_asset() directly - it calls LLMGateway.embed(), and blocking a
+request on a provider call is exactly what Sprint P8 moved agent/
+workflow runs out of the request/response cycle to avoid. See
+app/worker/dispatch.py's _process_asset_ingestion_job for where
+ingest_asset() actually runs.
 """
 from __future__ import annotations
 
@@ -18,15 +28,21 @@ from fastapi.responses import RedirectResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_roles
+from app.core.config import Settings, get_settings
 from app.database.session import get_db
+from app.jobs import service as job_service
 from app.models.enums import UserRole
 from app.models.user import User
-from app.schemas.asset import AssetRead
+from app.schemas.asset import AssetIngestionCreate, AssetRead
 from app.schemas.common import Page
+from app.schemas.job import JobRead
 from app.services import asset_service
 from app.services.exceptions import (
+    AssetAlreadyIngestedError,
     AssetDeletedError,
+    AssetIngestionAlreadyQueuedError,
     AssetNotFoundError,
+    AssetNotIngestableError,
     AssetStorageOperationFailedError,
     EmptyFileError,
     FileTooLargeError,
@@ -173,3 +189,58 @@ async def delete_asset(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail="storage operation failed"
         ) from exc
+
+
+@router.post(
+    "/assets/{asset_id}/ingest",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def enqueue_asset_ingestion(
+    asset_id: uuid.UUID,
+    payload: AssetIngestionCreate,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    current_user: User = Depends(_can_write),
+) -> JobRead:
+    try:
+        job = await job_service.enqueue_asset_ingestion(
+            db,
+            asset_id=asset_id,
+            embedding_model=payload.embedding_model,
+            embedding_provider=payload.embedding_provider,
+            chunk_size=payload.chunk_size,
+            chunk_overlap=payload.chunk_overlap,
+            max_attempts=settings.job_max_attempts,
+        )
+    except (AssetNotFoundError, AssetDeletedError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except AssetNotIngestableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)
+        ) from exc
+    except (AssetAlreadyIngestedError, AssetIngestionAlreadyQueuedError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    return JobRead.model_validate(job)
+
+
+@router.get(
+    "/assets/{asset_id}/ingest", response_model=JobRead, dependencies=[Depends(_can_read)]
+)
+async def get_asset_ingestion_status(
+    asset_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> JobRead:
+    """The most recently enqueued ingestion job for this asset - not the
+    asset itself (GET /assets/{asset_id} already covers that), and not
+    whether the asset HAS been ingested (that's queryable indirectly via
+    this job's `status`, once COMPLETED). 404 if no ingestion has ever
+    been requested for this asset - deliberately not distinguished from
+    "asset doesn't exist" at this endpoint, both are "nothing to report
+    here" from a caller's perspective."""
+    job = await job_service.get_latest_asset_ingestion_job(db, asset_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No ingestion job found for asset {asset_id}",
+        )
+    return JobRead.model_validate(job)

@@ -18,6 +18,7 @@ import contextlib
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +35,8 @@ from app.models.enums import AgentRunStatus, AgentStatus, JobStatus, UserRole, U
 from app.models.job import Job
 from app.models.user import User
 from app.models.worker_heartbeat import WorkerHeartbeat
+from app.storage.base import StorageBackend
+from app.storage.local import LocalStorageBackend
 from app.worker import runner
 
 
@@ -52,6 +55,17 @@ def _gateway(settings: Settings, provider: FakeProvider | None = None) -> LLMGat
     return LLMGateway(
         {"fake": provider or FakeProvider()}, settings, retry_base_delay_seconds=0.0
     )
+
+
+def _storage(tmp_path: Path) -> StorageBackend:
+    """None of this file's jobs are asset_ingestion (see
+    tests/test_worker_dispatch.py for that), so `storage` is never
+    actually read - it only needs to satisfy process_one_job/run_worker's
+    now-required parameter (Sprint P10B3). A real, isolated
+    LocalStorageBackend anyway, same as conftest.py's own storage_backend
+    fixture, rather than a bare mock - nothing here should ever touch the
+    real ./data/storage volume even by accident."""
+    return LocalStorageBackend(str(tmp_path / "storage"))
 
 
 async def _make_user(session: AsyncSession) -> User:
@@ -133,16 +147,20 @@ async def test_upsert_heartbeat_inserts_then_updates(worker_session_factory) -> 
 # --- process_one_job -------------------------------------------------------
 
 
-async def test_process_one_job_returns_false_when_queue_empty(worker_session_factory) -> None:
+async def test_process_one_job_returns_false_when_queue_empty(
+    worker_session_factory, tmp_path
+) -> None:
     settings = _settings()
     gateway = _gateway(settings)
     did_work = await runner.process_one_job(
-        worker_session_factory, gateway, settings, worker_id="w1"
+        worker_session_factory, gateway, settings, worker_id="w1", storage=_storage(tmp_path)
     )
     assert did_work is False
 
 
-async def test_process_one_job_claims_and_completes_a_real_job(worker_session_factory) -> None:
+async def test_process_one_job_claims_and_completes_a_real_job(
+    worker_session_factory, tmp_path
+) -> None:
     async with worker_session_factory() as setup_db:
         run_id = await _enqueue_agent_run(setup_db)
 
@@ -150,7 +168,7 @@ async def test_process_one_job_claims_and_completes_a_real_job(worker_session_fa
     gateway = _gateway(settings, FakeProvider(response_content="hi there"))
 
     did_work = await runner.process_one_job(
-        worker_session_factory, gateway, settings, worker_id="w1"
+        worker_session_factory, gateway, settings, worker_id="w1", storage=_storage(tmp_path)
     )
     assert did_work is True
 
@@ -221,7 +239,7 @@ async def test_heartbeat_while_running_stops_once_job_is_no_longer_running(
 # --- run_worker: startup stale-job recovery + heartbeat -------------------
 
 
-async def test_run_worker_recovers_stale_jobs_on_startup(worker_session_factory) -> None:
+async def test_run_worker_recovers_stale_jobs_on_startup(worker_session_factory, tmp_path) -> None:
     async with worker_session_factory() as setup_db:
         run_id = await _enqueue_agent_run(setup_db)
         result = await setup_db.execute(select(Job).where(Job.target_run_id == run_id))
@@ -245,6 +263,7 @@ async def test_run_worker_recovers_stale_jobs_on_startup(worker_session_factory)
         gateway=gateway,
         settings=settings,
         shutdown_event=shutdown_event,
+        storage=_storage(tmp_path),
     )
 
     async with worker_session_factory() as check_db:
@@ -253,7 +272,9 @@ async def test_run_worker_recovers_stale_jobs_on_startup(worker_session_factory)
         assert job.status == JobStatus.RETRYING
 
 
-async def test_run_worker_creates_worker_heartbeat_row_on_startup(worker_session_factory) -> None:
+async def test_run_worker_creates_worker_heartbeat_row_on_startup(
+    worker_session_factory, tmp_path
+) -> None:
     settings = _settings()
     gateway = _gateway(settings)
     shutdown_event = asyncio.Event()
@@ -265,6 +286,7 @@ async def test_run_worker_creates_worker_heartbeat_row_on_startup(worker_session
         gateway=gateway,
         settings=settings,
         shutdown_event=shutdown_event,
+        storage=_storage(tmp_path),
     )
 
     async with worker_session_factory() as check_db:

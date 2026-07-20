@@ -5,12 +5,16 @@ app/models/document_chunk.py's DocumentChunk table, the same "service
 layer ties a lower-level module to a table" pattern as
 app/services/asset_service.py for app.storage.
 
-Deliberately out of scope for this sprint: no HTTP endpoint -
-ingest_asset() is a plain service function, callable directly and
-wireable to an API route or a worker job in a later sprint; no re-
-ingestion/replace workflow - ingest_asset() is write-once per asset (see
-AssetAlreadyIngestedError below); no retrieval/similarity search; no
-OCR (see app/rag/extraction.py's docstring).
+Sprint P10B3 adds the HTTP endpoint deliberately deferred here
+(POST/GET /assets/{asset_id}/ingest, app/api/v1/assets.py) - but it
+enqueues a durable Job (app/jobs/service.py's enqueue_asset_ingestion)
+rather than calling ingest_asset() directly from the request/response
+cycle, same "don't block a request on a provider call" reasoning as
+Sprint P8's agent/workflow run queueing. ingest_asset() itself is now
+called from app/worker/dispatch.py instead. Still out of scope: no
+re-ingestion/replace workflow - ingest_asset() is write-once per asset
+(see AssetAlreadyIngestedError below); no retrieval/similarity search;
+no OCR (see app/rag/extraction.py's docstring).
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.llm.gateway import LLMGateway
 from app.llm.models import EmbeddingRequest
+from app.models.asset import Asset
 from app.models.document_chunk import DocumentChunk
 from app.rag.chunking import chunk_text
 from app.rag.exceptions import ExtractionError
@@ -47,6 +52,40 @@ class IngestionResult:
     provider: str
     model: str
     total_input_tokens: int
+
+
+async def check_ingestable(db: AsyncSession, asset_id: uuid.UUID) -> Asset:
+    """The upfront, non-authoritative checks ingest_asset() itself
+    performs before doing any storage/embedding work: the asset exists
+    and isn't deleted, its content type has a text extractor, and it
+    hasn't already been ingested. Factored out (Sprint P10B3) so
+    app/jobs/service.py's enqueue_asset_ingestion can run the exact same
+    checks synchronously at enqueue time - a bad asset_id, unsupported
+    content type, or already-ingested asset fails the POST
+    /assets/{id}/ingest request immediately (404/415/409) instead of
+    only surfacing once a worker eventually dequeues the job.
+
+    Not a substitute for the guarantees ingest_asset() and
+    app/models/job.py's uq_jobs_active_asset_ingestion index provide:
+    a race between this call and a concurrent enqueue/ingest is still
+    possible - see AssetAlreadyIngestedError's and
+    AssetIngestionAlreadyQueuedError's docstrings for how each race is
+    actually closed at the database level. This function is only ever
+    the fast path.
+    """
+    asset = await asset_service.get_asset(db, asset_id)  # AssetNotFoundError / AssetDeletedError
+
+    content_type = asset.content_type or asset.mime_type
+    if content_type not in SUPPORTED_CONTENT_TYPES:
+        raise AssetNotIngestableError(asset_id, content_type)
+
+    already_ingested = await db.scalar(
+        select(DocumentChunk.id).where(DocumentChunk.asset_id == asset_id).limit(1)
+    )
+    if already_ingested is not None:
+        raise AssetAlreadyIngestedError(asset_id)
+
+    return asset
 
 
 async def ingest_asset(
@@ -83,17 +122,8 @@ async def ingest_asset(
     avoids a wasted storage read and embedding call in the common,
     non-racing case).
     """
-    asset = await asset_service.get_asset(db, asset_id)  # AssetNotFoundError / AssetDeletedError
-
+    asset = await check_ingestable(db, asset_id)
     content_type = asset.content_type or asset.mime_type
-    if content_type not in SUPPORTED_CONTENT_TYPES:
-        raise AssetNotIngestableError(asset_id, content_type)
-
-    already_ingested = await db.scalar(
-        select(DocumentChunk.id).where(DocumentChunk.asset_id == asset_id).limit(1)
-    )
-    if already_ingested is not None:
-        raise AssetAlreadyIngestedError(asset_id)
 
     try:
         content = await storage.open(asset.storage_key)

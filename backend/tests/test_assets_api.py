@@ -1,7 +1,8 @@
 """Tests for the Asset API (Sprint P4): upload, list, detail, download,
 delete - plus the storage/database consistency guarantees the service
 layer promises (rollback-removes-storage-object, idempotent delete,
-storage-failure-leaves-db-untouched).
+storage-failure-leaves-db-untouched). Sprint P10B3 adds POST/GET
+/assets/{asset_id}/ingest.
 
 Uses the `client` fixture's isolated storage_backend (a fresh
 LocalStorageBackend rooted in a per-test tmp_path - see conftest.py) so
@@ -26,6 +27,7 @@ from app.storage.exceptions import StorageDeleteFailed
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPEG_BYTES = b"\xff\xd8\xff" + b"\x00" * 32
+TEXT_BYTES = b"hello world, this is a real ingestable document."
 
 
 def _files(content: bytes, filename: str = "test.png", content_type: str = "image/png") -> dict:
@@ -533,3 +535,156 @@ async def test_delete_storage_failure_leaves_asset_untouched(
     follow_up = await client.get(f"/api/v1/assets/{asset_id}", headers=operator_headers)
     assert follow_up.status_code == 200
     assert follow_up.json()["status"] == "available"
+
+
+# --- Ingestion (Sprint P10B3) ----------------------------------------------
+
+
+async def _upload_text_asset(client, headers: dict[str, str], product_id) -> str:
+    response = await _upload(
+        client,
+        headers,
+        product_id,
+        content=TEXT_BYTES,
+        filename="doc.txt",
+        content_type="text/plain",
+    )
+    assert response.status_code == 201
+    return response.json()["id"]
+
+
+def _ingest_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {"embedding_model": "fake-embed-v1"}
+    payload.update(overrides)
+    return payload
+
+
+async def test_operator_can_enqueue_ingestion(client, operator_headers, product) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest",
+        json=_ingest_payload(),
+        headers=operator_headers,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_type"] == "asset_ingestion"
+    assert body["status"] == "queued"
+    assert body["input_json"]["embedding_model"] == "fake-embed-v1"
+    assert body["input_json"]["chunk_size"] == 1000
+    assert body["input_json"]["chunk_overlap"] == 200
+    assert uuid.UUID(body["id"])
+
+
+async def test_admin_can_enqueue_ingestion(client, admin_headers, operator_headers, product) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=admin_headers
+    )
+    assert response.status_code == 202
+
+
+async def test_viewer_cannot_enqueue_ingestion(
+    client, operator_headers, viewer_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=viewer_headers
+    )
+    assert response.status_code == 403
+
+
+async def test_unauthenticated_cannot_enqueue_ingestion(
+    client, operator_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload()
+    )
+    assert response.status_code == 401
+
+
+async def test_enqueue_ingestion_unknown_asset_returns_404(client, operator_headers) -> None:
+    response = await client.post(
+        f"/api/v1/assets/{uuid.uuid4()}/ingest", json=_ingest_payload(), headers=operator_headers
+    )
+    assert response.status_code == 404
+
+
+async def test_enqueue_ingestion_unsupported_content_type_returns_415(
+    client, operator_headers, product
+) -> None:
+    uploaded = await _upload(client, operator_headers, product.id)  # default: image/png
+    asset_id = uploaded.json()["id"]
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=operator_headers
+    )
+    assert response.status_code == 415
+
+
+async def test_enqueue_ingestion_twice_returns_409(client, operator_headers, product) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    first = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=operator_headers
+    )
+    second = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=operator_headers
+    )
+    assert first.status_code == 202
+    assert second.status_code == 409
+
+
+async def test_enqueue_ingestion_missing_embedding_model_returns_422(
+    client, operator_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json={}, headers=operator_headers
+    )
+    assert response.status_code == 422
+
+
+async def test_enqueue_ingestion_chunk_overlap_not_smaller_than_chunk_size_returns_422(
+    client, operator_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest",
+        json=_ingest_payload(chunk_size=100, chunk_overlap=100),
+        headers=operator_headers,
+    )
+    assert response.status_code == 422
+
+
+async def test_get_ingestion_status_before_any_request_returns_404(
+    client, operator_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+
+    response = await client.get(f"/api/v1/assets/{asset_id}/ingest", headers=operator_headers)
+    assert response.status_code == 404
+
+
+async def test_get_ingestion_status_returns_the_queued_job(
+    client, operator_headers, viewer_headers, product
+) -> None:
+    asset_id = await _upload_text_asset(client, operator_headers, product.id)
+    enqueued = await client.post(
+        f"/api/v1/assets/{asset_id}/ingest", json=_ingest_payload(), headers=operator_headers
+    )
+    assert enqueued.status_code == 202
+
+    # Any active role can read status - not just operator/admin.
+    response = await client.get(f"/api/v1/assets/{asset_id}/ingest", headers=viewer_headers)
+    assert response.status_code == 200
+    assert response.json()["id"] == enqueued.json()["id"]
+    assert response.json()["status"] == "queued"

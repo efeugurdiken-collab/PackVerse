@@ -33,6 +33,26 @@ sprint).
 AgentRun/WorkflowRun row is the single source of truth for output, per
 the "each domain owns its own persistence" pattern already established;
 duplicating it here would just be another place for it to drift.
+
+`job_type` gained a third value in Sprint P10B3, `"asset_ingestion"` -
+`target_run_id` then points at `assets.id` rather than a run table row,
+same polymorphic convention as above (still no FK, still resolved by
+`job_type` at read time; see app/jobs/service.py's
+enqueue_asset_ingestion and app/worker/dispatch.py's
+_process_asset_ingestion_job). Unlike an agent/workflow run - where
+concurrent double-submission is legitimate (each POST is supposed to
+create a new run) - asset ingestion is write-once per asset (see
+app/services/exceptions.py's AssetAlreadyIngestedError), so two
+concurrent enqueue calls for the same asset_id is a real race, not just
+a UX nuisance: both could pass an application-level "not already
+ingested" check before either commits, each paying for a full embedding
+call before colliding at the document_chunks level. uq_jobs_active_
+asset_ingestion below closes that race at the database level (the same
+"index is the actual guarantee, an upfront check is only the fast
+path" pattern document_chunks' own (asset_id, chunk_index) unique
+constraint already uses) - it does NOT constrain agent_run/
+workflow_run jobs at all, since its WHERE clause is scoped to
+job_type = 'asset_ingestion'.
 """
 from __future__ import annotations
 
@@ -40,16 +60,46 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
 from app.models.enums import JobStatus
 
+# sqlalchemy.Enum(JobStatus, native_enum=False) with no values_callable
+# (see `status` below) persists each member's *name* ("QUEUED"), not its
+# .value ("queued") - that's SQLAlchemy's documented default for a
+# non-native enum column. The partial index's WHERE clause below must
+# match that exact on-disk representation, or it silently matches zero
+# rows and enforces nothing. Built from JobStatus itself rather than
+# hand-typed so a future rename of these members can't quietly
+# reintroduce that bug - see tests/test_job_service.py's
+# test_partial_unique_index_rejects_two_active_ingestion_jobs_for_same_asset,
+# which fails loudly the moment this predicate stops matching real rows.
+_ACTIVE_ASSET_INGESTION_STATUSES_SQL = ", ".join(
+    f"'{s.name}'" for s in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING)
+)
+
 
 class Job(Base, TimestampMixin):
     __tablename__ = "jobs"
+    __table_args__ = (
+        # Partial unique index, not a plain unique constraint: it only
+        # ever applies to asset_ingestion jobs that are still QUEUED/
+        # RUNNING/RETRYING, so a second ingestion attempt is free to be
+        # enqueued once an earlier one has reached a terminal state
+        # (COMPLETED/FAILED/CANCELLED) - see module docstring above.
+        Index(
+            "uq_jobs_active_asset_ingestion",
+            "target_run_id",
+            unique=True,
+            postgresql_where=text(
+                f"job_type = 'asset_ingestion' AND "
+                f"status IN ({_ACTIVE_ASSET_INGESTION_STATUSES_SQL})"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

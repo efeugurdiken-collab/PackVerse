@@ -193,3 +193,20 @@ class IngestionEmbeddingMismatchError(DomainError):
         self.asset_id = asset_id
         self.expected = expected
         self.actual = actual
+
+
+class AssetIngestionAlreadyQueuedError(DomainError):
+    """Raised by app/jobs/service.py's enqueue_asset_ingestion (Sprint
+    P10B3) when a non-terminal (QUEUED/RUNNING/RETRYING) ingestion job
+    already exists for this asset_id - whether caught by the upfront
+    "no chunks yet" check it shares with ingest_asset() (see
+    app/services/ingestion_service.py's check_ingestable) or by losing a
+    concurrent-enqueue race at commit time (a duplicate-key
+    IntegrityError on app/models/job.py's uq_jobs_active_asset_ingestion
+    partial unique index). Distinct from AssetAlreadyIngestedError
+    above: that one means chunks already exist; this one means another
+    ingestion attempt is already in flight and hasn't finished yet."""
+
+    def __init__(self, asset_id: object) -> None:
+        super().__init__(f"Asset {asset_id} already has an ingestion job in progress")
+        self.asset_id = asset_id

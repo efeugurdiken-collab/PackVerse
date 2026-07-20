@@ -43,6 +43,7 @@ from app.llm.gateway import LLMGateway
 from app.models.enums import JobStatus
 from app.models.job import Job
 from app.models.worker_heartbeat import WorkerHeartbeat
+from app.storage.base import StorageBackend
 from app.worker.dispatch import process_claimed_job
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ async def process_one_job(
     settings: Settings,
     *,
     worker_id: str,
+    storage: StorageBackend,
 ) -> bool:
     """Claims and executes at most one job. Returns whether it did any
     work (False means the queue was empty right now)."""
@@ -127,7 +129,7 @@ async def process_one_job(
             )
         )
         try:
-            await process_claimed_job(db, gateway, settings, job=job)
+            await process_claimed_job(db, gateway, settings, job=job, storage=storage)
         finally:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -142,6 +144,7 @@ async def run_worker(
     gateway: LLMGateway,
     settings: Settings,
     shutdown_event: asyncio.Event,
+    storage: StorageBackend,
 ) -> None:
     """The main loop. Runs a stale-job recovery pass on startup, then
     repeatedly claims+executes one job at a time (sleeping
@@ -149,7 +152,18 @@ async def run_worker(
     this worker's own heartbeat every iteration, until shutdown_event is
     set. A periodic recovery pass also runs on a slower cadence so a job
     whose worker crashed mid-execution doesn't wait forever for someone
-    else to notice."""
+    else to notice.
+
+    `storage` is threaded through explicitly, same as `gateway` - only
+    Sprint P10B3's asset_ingestion jobs need it (app/worker/dispatch.py's
+    _process_asset_ingestion_job calls app.services.ingestion_service.
+    ingest_asset(), which needs a StorageBackend the same way
+    app/api/v1/assets.py does via FastAPI's Depends(get_storage_backend))
+    - agent/workflow-run jobs ignore it entirely. Constructed once by
+    app/worker/main.py's entrypoint via app.storage.factory.
+    get_storage_backend(), the exact same "call the process-wide cached
+    factory once, then pass the instance around explicitly" pattern
+    already used for `gateway` (app.llm.factory.get_llm_gateway())."""
     started_at = datetime.now(timezone.utc)
     async with session_factory() as db:
         await upsert_heartbeat(db, worker_id, started_at=started_at)
@@ -163,7 +177,9 @@ async def run_worker(
     last_recovery_check = datetime.now(timezone.utc)
 
     while not shutdown_event.is_set():
-        did_work = await process_one_job(session_factory, gateway, settings, worker_id=worker_id)
+        did_work = await process_one_job(
+            session_factory, gateway, settings, worker_id=worker_id, storage=storage
+        )
 
         async with session_factory() as db:
             await upsert_heartbeat(db, worker_id, started_at=started_at)

@@ -2,12 +2,14 @@
 
 Wires app/worker/runner.py's `run_worker` to the real
 app.database.session.AsyncSessionLocal, app.llm.factory.get_llm_gateway,
-and app.core.config.get_settings - the same production dependencies
-app/main.py's FastAPI app uses, obtained the exact same way, so the
-worker and the API process share one engine/pool configuration and one
-provider-registry cache mechanism (each is a separate OS process, so
-each gets its own actual engine/registry instances - only the
-construction path is shared).
+app.storage.factory.get_storage_backend (Sprint P10B3, for
+asset_ingestion jobs), and app.core.config.get_settings - the same
+production dependencies app/main.py's FastAPI app uses, obtained the
+exact same way, so the worker and the API process share one
+engine/pool configuration and one provider-registry/storage-backend
+cache mechanism (each is a separate OS process, so each gets its own
+actual engine/registry/backend instances - only the construction path
+is shared).
 
 Handles SIGTERM/SIGINT by setting the shutdown_event runner.run_worker
 watches, so `docker compose stop` (SIGTERM, with a grace period before
@@ -24,6 +26,7 @@ import signal
 from app.core.config import get_settings
 from app.database.session import AsyncSessionLocal
 from app.llm.factory import get_llm_gateway
+from app.storage.factory import get_storage_backend
 from app.worker.runner import default_worker_id, run_worker
 
 logging.basicConfig(
@@ -36,6 +39,7 @@ logger = logging.getLogger(__name__)
 async def _amain() -> None:
     settings = get_settings()
     gateway = get_llm_gateway()
+    storage = get_storage_backend()
     worker_id = default_worker_id()
     shutdown_event = asyncio.Event()
 
@@ -60,6 +64,7 @@ async def _amain() -> None:
             gateway=gateway,
             settings=settings,
             shutdown_event=shutdown_event,
+            storage=storage,
         )
     finally:
         logger.info("worker %s shutting down", worker_id)

@@ -34,6 +34,7 @@ from app.database.session import get_db
 from app.main import app
 from app.models import Base
 from app.models.agent_definition import AgentDefinition
+from app.models.asset import Asset
 from app.models.enums import (
     AgentStatus,
     JobStatus,
@@ -371,8 +372,8 @@ def make_document_chunk(
     P10B1). No auto-created parent Asset - same "caller supplies the
     required foreign key" convention as make_job's target_run_id;
     document_chunks tests construct their own Product/Asset first, the
-    same way tests/test_models.py does, since there is no make_asset
-    fixture in this codebase either."""
+    same way tests/test_models.py does (predates the make_asset fixture
+    below, added in Sprint P10B3)."""
 
     async def _make_document_chunk(
         *,
@@ -397,6 +398,56 @@ def make_document_chunk(
         return chunk
 
     return _make_document_chunk
+
+
+@pytest.fixture
+def make_asset(
+    db_session: AsyncSession, storage_backend: StorageBackend
+) -> Callable[..., Awaitable[Asset]]:
+    """Factory fixture: `await make_asset(content=b"...", content_type="text/plain")`
+    writes real bytes through the isolated storage_backend fixture and
+    inserts the matching Asset row via the ORM (Sprint P10B3, for the
+    ingestion job/API tests - test_ingestion_service.py predates this
+    fixture and keeps its own equivalent local `_make_asset` helper
+    rather than being refactored to use it). Auto-creates its own
+    Product unless one is passed in, same "caller supplies the FK, or
+    get a sensible default" convention as make_document_chunk."""
+
+    async def _make_asset(
+        *,
+        product: Product | None = None,
+        content: bytes = b"hello world",
+        content_type: str = "text/plain",
+        filename: str = "doc.txt",
+    ) -> Asset:
+        if product is None:
+            product = Product(
+                slug=f"product-{uuid.uuid4().hex[:10]}",
+                title="Test Product",
+                product_type=ProductType.PROMPT_PACK,
+                status=ProductStatus.DRAFT,
+            )
+            db_session.add(product)
+            await db_session.flush()
+
+        storage_key = f"assets/{uuid.uuid4()}/{filename}"
+        await storage_backend.store(storage_key, content, content_type=content_type)
+        asset = Asset(
+            product_id=product.id,
+            asset_type="source",
+            filename=filename,
+            storage_key=storage_key,
+            mime_type=content_type,
+            content_type=content_type,
+            size_bytes=len(content),
+            checksum=hashlib.sha256(content).hexdigest(),
+        )
+        db_session.add(asset)
+        await db_session.commit()
+        await db_session.refresh(asset)
+        return asset
+
+    return _make_asset
 
 
 @pytest.fixture

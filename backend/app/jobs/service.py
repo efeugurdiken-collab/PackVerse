@@ -32,6 +32,19 @@ and branch on the JOB's status (not just the run's):
   through to the existing run-level cancel unchanged, which raises the
   correct InvalidRunTransitionError/InvalidWorkflowRunTransitionError or
   succeeds exactly as it did before this sprint.
+
+Asset ingestion (Sprint P10B3): enqueue_asset_ingestion follows the same
+"validate via the existing check, then persist one Job row, one commit"
+shape as enqueue_agent_run/enqueue_workflow_run, but there is no paired
+run row to create alongside it - the Job row IS the durable record of
+this ingestion attempt (app/services/ingestion_service.py's DocumentChunk
+rows are the eventual result). Concurrent double-enqueue for the same
+asset is closed at the database level by app/models/job.py's
+uq_jobs_active_asset_ingestion partial unique index, not just the
+upfront check_ingestable() call - see that index's docstring for why
+this differs from agent/workflow runs, where concurrent double-
+submission is legitimate rather than a bug. No cancel_asset_ingestion
+here (yet) - see the Sprint P10B3 report's Known Limitations.
 """
 from __future__ import annotations
 
@@ -39,6 +52,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.jobs import queue
@@ -49,10 +63,13 @@ from app.models.job import Job
 from app.models.user import User
 from app.models.workflow_run import WorkflowRun
 from app.runtime import service as runtime_service
+from app.services import ingestion_service
+from app.services.exceptions import AssetIngestionAlreadyQueuedError
 from app.workflows import service as workflow_service
 
 AGENT_RUN_JOB_TYPE = "agent_run"
 WORKFLOW_RUN_JOB_TYPE = "workflow_run"
+ASSET_INGESTION_JOB_TYPE = "asset_ingestion"
 
 
 async def get_job(db: AsyncSession, job_id: uuid.UUID) -> Job:
@@ -129,6 +146,81 @@ async def enqueue_workflow_run(
     await db.refresh(run)
     await db.refresh(job)
     return run, job
+
+
+async def enqueue_asset_ingestion(
+    db: AsyncSession,
+    *,
+    asset_id: uuid.UUID,
+    embedding_model: str,
+    embedding_provider: str | None,
+    chunk_size: int,
+    chunk_overlap: int,
+    max_attempts: int,
+) -> Job:
+    """Validates asset_id via app.services.ingestion_service.
+    check_ingestable (asset exists/not deleted, content type
+    ingestable, not already ingested - AssetNotFoundError/
+    AssetDeletedError/AssetNotIngestableError/AssetAlreadyIngestedError
+    propagate unchanged) and persists a QUEUED Job pointing at it
+    (target_run_id=asset_id, job_type=ASSET_INGESTION_JOB_TYPE) - same
+    polymorphic-target convention as enqueue_agent_run/
+    enqueue_workflow_run's target_run_id, see app/models/job.py's module
+    docstring. embedding_model/embedding_provider/chunk_size/
+    chunk_overlap travel in input_json exactly like user_input/context
+    do for an agent/workflow run - app/worker/dispatch.py's
+    _process_asset_ingestion_job reads them back out to call
+    ingest_asset().
+
+    Raises AssetIngestionAlreadyQueuedError if a non-terminal ingestion
+    job already exists for this asset - app/models/job.py's
+    uq_jobs_active_asset_ingestion partial unique index is the actual
+    guarantee (this function's IntegrityError handling below is what
+    turns a lost race into that domain error); nothing here does a
+    "check then insert" that could itself race safely without it.
+    """
+    await ingestion_service.check_ingestable(db, asset_id)
+
+    job = Job(
+        id=uuid.uuid4(),
+        job_type=ASSET_INGESTION_JOB_TYPE,
+        status=JobStatus.QUEUED,
+        target_run_id=asset_id,
+        input_json={
+            "embedding_model": embedding_model,
+            "embedding_provider": embedding_provider,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+        },
+        max_attempts=max_attempts,
+    )
+    db.add(job)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise AssetIngestionAlreadyQueuedError(asset_id) from exc
+    await db.refresh(job)
+    return job
+
+
+async def get_latest_asset_ingestion_job(db: AsyncSession, asset_id: uuid.UUID) -> Job | None:
+    """The most recently created asset_ingestion Job targeting
+    asset_id, or None if this asset has never had one enqueued - backs
+    GET /assets/{asset_id}/ingest (app/api/v1/assets.py). Deliberately
+    the newest, not "the currently-active one": once a job reaches a
+    terminal state a caller can enqueue a new one (see
+    uq_jobs_active_asset_ingestion's docstring), and the newest job is
+    always the one whose status answers "what happened to my most
+    recent ingest request" - the same job a caller who just POSTed
+    would expect to see."""
+    result = await db.execute(
+        select(Job)
+        .where(Job.job_type == ASSET_INGESTION_JOB_TYPE, Job.target_run_id == asset_id)
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def cancel_agent_run(db: AsyncSession, run_id: uuid.UUID, current_user: User) -> AgentRun:
