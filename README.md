@@ -921,10 +921,76 @@ persists a subset of an asset's chunks.
 
 **Known limitations:** no OCR (a scanned/image-only PDF with no text
 layer raises `EmptyExtractedTextError`), no DOCX/HTML extraction, no
-retrieval/similarity-search API, no chunk deletion/update endpoints, and
-no cancellation endpoint for an in-flight or queued ingestion job
-(unlike agent/workflow runs - see Job Queue & Worker above) - all
-deferred to a later sprint per the RAG roadmap item.
+chunk deletion/update endpoints, and no cancellation endpoint for an
+in-flight or queued ingestion job (unlike agent/workflow runs - see Job
+Queue & Worker above) - all deferred to a later sprint per the RAG
+roadmap item. Similarity search now exists as of Sprint P10B4 - see
+Retrieval below.
+
+## Retrieval (Sprint P10B4: similarity search - RAG track, roadmap item 10)
+
+`app/services/retrieval_service.py`'s `search()` embeds a query string
+in a single `LLMGateway.embed()` call (Sprint P10A, the same gateway
+`ingest_asset()` uses) and ranks `document_chunks` rows against it by
+pgvector cosine distance (`app/rag/retrieval.py`'s
+`cosine_distance_to_score` converts a raw `[0, 2]` distance into a
+`[-1, 1]` similarity score - both are returned on every result, never
+just one). It is a **plain async service function, callable directly**
+(or from a script/REPL against a running stack) - same "no HTTP endpoint
+yet" starting point Sprint P10B2's `ingest_asset()` had before Sprint
+P10B3 added one; this sprint deliberately stops at the service layer.
+
+```python
+results = await search(
+    db, gateway,
+    query="what is the refund policy?",
+    embedding_model="text-embedding-3-small",   # required, no default - same as ingest_asset()
+    top_k=10,                                    # optional, clamped to [1, 50]
+    asset_ids=[...],                              # optional - omit to search every ingested asset
+)
+# -> list[ScoredChunk], nearest first, each with .content/.distance/.score/.asset_id/...
+```
+
+**Two filters are always applied, regardless of `asset_ids`:**
+1. `DocumentChunk.embedding_model == response.model` - the model the
+   gateway actually *resolved* the request to (`app/llm/routing.py`'s
+   alias resolution means this can differ from the `embedding_model`
+   argument), never the raw argument. `document_chunks.embedding_model`
+   was populated from this same resolved value at ingestion time, so
+   filtering on anything else would either compare differently-
+   dimensioned vectors (pgvector has no fixed dimension on this column -
+   see `app/models/document_chunk.py`) or silently return zero rows
+   whenever an alias was requested.
+2. `Asset.status == AssetStatus.AVAILABLE` and `Asset.deleted_at IS
+   NULL` - a soft-deleted or not-yet-available asset's chunks are never
+   returned, even if explicitly named in `asset_ids` - mirrors
+   `asset_service.list_assets_for_product`'s own status filter.
+
+**No tenant isolation concept applies** - this codebase has no
+organization/tenant model (only `viewer`/`operator`/`admin` roles) - so
+the only scoping lever beyond the two mandatory filters above is the
+optional, caller-supplied `asset_ids`.
+
+**Limits and failure behavior:** `top_k` is clamped to `[1, 50]`, never
+rejected - same convention as `list_assets_for_product`'s own
+limit/offset clamping. A blank/whitespace-only `query` raises
+`EmptyQueryError` before any embedding call is made. `LLMError` from
+`gateway.embed()` propagates unwrapped, same as `ingest_asset()`. There
+is no "no results" error path - an empty corpus, no chunks under the
+resolved embedding model, or an `asset_ids` filter matching nothing all
+return `[]`.
+
+**Known limitations:** no HTTP endpoint, no runtime RAG prompt
+injection/chat/agent integration, no answer generation, no reranking, no
+hybrid keyword search, no worker/background retrieval (this is a
+synchronous read - there is no provider write to protect from a request
+timeout the way ingestion's embedding call needed Sprint P8's job
+queue), no OCR, no re-indexing, and no chunk update/delete workflows -
+all deferred per the RAG roadmap item. No approximate-nearest-neighbor
+index (`ivfflat`/`hnsw`) either - pgvector performs exact KNN via
+sequential scan without one, correct at this stage's data volumes;
+adding one later is index-only, no migration to the `document_chunks`
+table's own columns required.
 
 ## Local Development (without Docker)
 
@@ -1000,6 +1066,8 @@ Test files:
 | `tests/test_document_chunk_models.py` | `DocumentChunk` (Sprint P10B1): field persistence, `(asset_id, chunk_index)` uniqueness, cascade delete when the parent `Asset` is deleted |
 | `tests/test_extraction.py` | `app.rag.extraction` (Sprint P10B2): plain text/markdown UTF-8 decoding (round-trip, unicode, empty, invalid-UTF-8 rejection), PDF text extraction against hand-built (not fixture-file) PDFs - single-page, multi-page ordering, corrupt-PDF rejection, password-protected rejection - and the `extract_text` content-type dispatcher, including its rejection of an unsupported content type |
 | `tests/test_ingestion_service.py` | `app.services.ingestion_service.ingest_asset` (Sprint P10B2, against a real `LocalStorageBackend` and a `FakeProvider`-backed `LLMGateway`): happy path for a `text/plain` and an `application/pdf` asset (chunk count, `content_hash`, embeddings, `embedding_model`/`embedding_provider` all persisted correctly), every failure mode - missing/deleted asset, unsupported content type, invalid UTF-8, corrupt PDF, empty extracted text, an embedding-call `LLMError` propagating unwrapped, already-ingested rejection - each confirmed to leave zero `document_chunks` rows behind, and `chunk_size`/`chunk_overlap` pass-through to `chunk_text`; unchanged by Sprint P10B3's `check_ingestable` extraction (same checks, same exceptions, now shared with `enqueue_asset_ingestion`) |
+| `tests/test_rag_retrieval.py` | `app.rag.retrieval` (Sprint P10B4): `cosine_distance_to_score` at the identical/orthogonal/opposite-direction boundary values and arbitrary midpoints, `ScoredChunk` field carrying |
+| `tests/test_retrieval_service.py` | `app.services.retrieval_service.search` (Sprint P10B4, against a real pgvector query and a `FakeProvider`-subclass-backed `LLMGateway` that returns a caller-specified fixed vector): nearest-first ranking with consistent `distance`/`score`, `top_k` limiting and clamping (both directions), `asset_ids` filtering (present/absent/empty), mandatory-filter proof for both asset availability (`pending`/`failed`/soft-deleted excluded, including when explicitly named in `asset_ids`) and `embedding_model` (a same-vector chunk under a different model never appears), alias resolution correctness (`response.model`, not the requested alias, is what's actually filtered on), empty-corpus and blank-query behavior (the latter proven never to reach the gateway), `LLMError` propagating unwrapped |
 
 Each test gets its own database transaction (via `tests/conftest.py`'s
 `db_session`/`client` fixtures) that is rolled back afterward, so tests
@@ -1071,8 +1139,14 @@ and prints `ALL CHECKS PASSED` only on a genuine clean run:
     `Job` (reusing the P8 queue/worker) rather than calling
     `ingest_asset()` synchronously, with a database-level partial unique
     index (`uq_jobs_active_asset_ingestion`) closing the concurrent-
-    double-enqueue race - still no retrieval/similarity-search, OCR, or
-    re-ingestion), awaiting CTO local verification**
+    double-enqueue race; P10B4: retrieval service
+    (`app/services/retrieval_service.py`) - embeds a query via the same
+    `LLMGateway.embed()` and ranks `document_chunks` by pgvector cosine
+    distance, mandatorily scoped to the resolved embedding model and
+    available/non-deleted assets, with an optional `asset_ids` filter -
+    still no HTTP endpoint, OCR, re-indexing, reranking, hybrid search,
+    or any runtime prompt/chat/agent integration), awaiting CTO local
+    verification**
 11. Product Factory
 12. Marketplace Automation
 13. Deployment

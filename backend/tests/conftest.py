@@ -37,6 +37,7 @@ from app.models.agent_definition import AgentDefinition
 from app.models.asset import Asset
 from app.models.enums import (
     AgentStatus,
+    AssetStatus,
     JobStatus,
     ProductStatus,
     ProductType,
@@ -411,7 +412,17 @@ def make_asset(
     fixture and keeps its own equivalent local `_make_asset` helper
     rather than being refactored to use it). Auto-creates its own
     Product unless one is passed in, same "caller supplies the FK, or
-    get a sensible default" convention as make_document_chunk."""
+    get a sensible default" convention as make_document_chunk.
+
+    `status` defaults to AVAILABLE, not the Asset model's own column
+    default (PENDING, "mid-upload, storage write not yet confirmed") -
+    every existing caller of this fixture (P10B3's ingestion tests)
+    never asserted on status and works identically either way (ingestion
+    checks content_type, never status), so this only changes behavior
+    for Sprint P10B4's retrieval tests, which need an explicit,
+    overridable status to exercise app.services.retrieval_service.
+    search()'s `Asset.status == AssetStatus.AVAILABLE` filter (and its
+    negative case) without every other caller needing to pass it."""
 
     async def _make_asset(
         *,
@@ -419,6 +430,7 @@ def make_asset(
         content: bytes = b"hello world",
         content_type: str = "text/plain",
         filename: str = "doc.txt",
+        status: AssetStatus = AssetStatus.AVAILABLE,
     ) -> Asset:
         if product is None:
             product = Product(
@@ -441,6 +453,7 @@ def make_asset(
             content_type=content_type,
             size_bytes=len(content),
             checksum=hashlib.sha256(content).hexdigest(),
+            status=status,
         )
         db_session.add(asset)
         await db_session.commit()

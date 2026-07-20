@@ -210,3 +210,17 @@ class AssetIngestionAlreadyQueuedError(DomainError):
     def __init__(self, asset_id: object) -> None:
         super().__init__(f"Asset {asset_id} already has an ingestion job in progress")
         self.asset_id = asset_id
+
+
+# --- Retrieval domain errors (Sprint P10B4) ---
+# Raised by app/services/retrieval_service.py's search(). Deliberately a
+# single, narrow error: out-of-range top_k/asset_ids are clamped or
+# naturally empty rather than rejected (see that module's docstring) -
+# an empty/whitespace-only query is the one input that's meaningless
+# rather than merely out of range, so it's the one case worth failing
+# loudly, before any embedding call is wasted.
+
+
+class EmptyQueryError(DomainError):
+    def __init__(self) -> None:
+        super().__init__("Retrieval query must not be empty")
